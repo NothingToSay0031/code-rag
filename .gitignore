@@ -1,0 +1,8 @@
+test*/
+*.pyc
+*.log
+*cache/
+.sisyphus/
+.venv/
+nul
+run_index.py

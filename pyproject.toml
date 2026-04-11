@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "code-rag"
+version = "0.1.0"
+description = "Local code repository RAG with MCP server"
+requires-python = ">=3.14"
+dependencies = [
+    "fastmcp>=2.0",
+    "tree-sitter>=0.24",
+    "tree-sitter-python",
+    "tree-sitter-javascript",
+    "tree-sitter-typescript",
+    "tree-sitter-cpp",
+    "tree-sitter-c",
+    "tree-sitter-java",
+    "tree-sitter-c-sharp",
+    "tree-sitter-lua",
+    "tree-sitter-rust",
+    "tree-sitter-go",
+    "sentence-transformers",
+    "onnxruntime",
+    "chromadb",
+    "rank-bm25",
+    "click",
+    "pathspec",
+]
+
+# NOTE: torch is NOT listed here. CUDA vs CPU torch is handled entirely
+# by the install script using `uv pip install` with the correct --index-url.
+# This avoids the uv.lock conflict where PyPI CPU torch and pytorch-index
+# CUDA torch share the same version number (e.g. 2.7.0).
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+]
+
+[project.scripts]
+code-rag = "code_rag.cli:main"
