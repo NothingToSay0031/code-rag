@@ -1,6 +1,6 @@
 # code-rag
 
-Local code repository RAG with MCP server — index your codebase and search it semantically from any AI editor.
+Local code repository RAG with MCP server — index your codebase and search it semantically.
 
 ## One-click install
 
@@ -10,7 +10,7 @@ Local code repository RAG with MCP server — index your codebase and search it 
 irm https://raw.githubusercontent.com/NothingToSay0031/code-rag/master/install.ps1 | iex
 ```
 
-### macOS / Linux
+### macOS / Linux (Not functionally tested yet, but should work)
 
 ```bash
 curl -sSfL https://raw.githubusercontent.com/NothingToSay0031/code-rag/master/install.sh | bash
@@ -24,14 +24,14 @@ curl -sSfL https://raw.githubusercontent.com/NothingToSay0031/code-rag/master/in
 
 ```bash
 # 1. Index a repository
-code-rag init /path/to/your/project
+code-rag init "path/to/your/project" --include "Engine/Shaders/**" --include "Engine/Sources/**" --exclude "Engine/Sources/External/**"
 
-# 2. Open the project in your AI editor
-#    → opencode.json / .cursor/mcp.json / .vscode/mcp.json are created automatically
+# 2. Open the project in your AI agent
+#    → opencode.json are created automatically
 #    → the MCP server is active only for this project
 ```
 
-That's it. Your AI editor will now use `code-rag` tools to search the codebase.
+That's it. Your AI agent will now use `code-rag` tools to search the codebase.
 
 ---
 
@@ -41,7 +41,7 @@ Running `code-rag init` writes config files **inside the indexed repo**:
 
 | File | Client |
 |------|--------|
-| `opencode.json` | OpenCode / Codemaker |
+| `opencode.json` | OpenCode |
 
 Each file points the MCP at the specific repo path, so the tools are only active when you open that project — not globally in every session.
 
@@ -89,29 +89,12 @@ Unchanged files are skipped entirely, so incremental updates are fast even on la
 
 ---
 
-## Manual install (advanced)
-
-Requirements: **Python 3.11+**, **git**, [**uv**](https://docs.astral.sh/uv/)
-
-```bash
-git clone https://github.com/NothingToSay0031/code-rag
-cd code-rag
-uv sync          # CPU torch (default)
-
-# CUDA upgrade (optional, ~2 GB download):
-.venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cu128 --upgrade
-```
-
-Add the `.venv/bin/code-rag` (or `.venv\Scripts\code-rag.exe` on Windows) to your `PATH`, or use `uv run code-rag`.
-
----
-
 ## Supported languages
 
 Python, JavaScript, TypeScript, C, C++, Java, C#, Rust, Go, Lua — plus documentation (Markdown, RST, plain text).
 
 ## Requirements
 
-- Python 3.11+
+- Python 3.14+
 - ~500 MB disk per indexed repo (vectors + BM25 index)
 - RAM: ~1 GB for the embedding model (CPU), ~2 GB (GPU)

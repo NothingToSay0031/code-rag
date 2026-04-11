@@ -6,6 +6,7 @@ import hashlib
 from pathlib import Path
 
 from pathspec import PathSpec
+from tqdm import tqdm
 
 from code_rag.config import CodeRagConfig, parse_coderagfilter
 
@@ -204,93 +205,107 @@ def discover_files(repo_path: Path, config: CodeRagConfig) -> list[Path]:
     visited: set[Path] = set()
     result: list[Path] = []
 
-    for entry in repo_path.rglob("*"):
-        # Only files
-        if not entry.is_file():
-            continue
+    pbar = tqdm(
+        desc="Scanning",
+        unit=" entries",
+        mininterval=0.2,
+        leave=False,
+    )
+    try:
+        for entry in repo_path.rglob("*"):
+            pbar.update(1)
 
-        # Symlink cycle detection
-        try:
-            resolved = entry.resolve()
-        except OSError:
-            continue
-        if resolved in visited:
-            continue
-        visited.add(resolved)
+            # Only files
+            if not entry.is_file():
+                continue
 
-        # Relative path for pattern matching (use forward-slash string)
-        rel = entry.relative_to(repo_path)
-        parts = rel.parts
-
-        # (a) Skip hidden directories
-        if any(p.startswith(".") and p != "." for p in parts[:-1]):
-            continue
-
-        # (b) Skip junk directories
-        if any(p in _JUNK_DIRS for p in parts[:-1]):
-            continue
-
-        # Use forward-slash relative string for pathspec matching
-        rel_str = rel.as_posix()
-
-        # CLI --include is the highest-priority override: if specified and matches,
-        # the file is included regardless of .gitignore/.coderagfilter excludes.
-        force_included = cli_include_spec and cli_include_spec.match_file(rel_str)
-
-        if not force_included:
-            # (c) .gitignore
-            if gitignore_spec and gitignore_spec.match_file(rel_str):
-                # Check .coderagfilter include (re-include overrides .gitignore)
-                if not (
-                    coderag_include_spec and coderag_include_spec.match_file(rel_str)
-                ):
-                    continue
-
-            # (d) .coderagfilter excludes
-            if coderag_exclude_spec and coderag_exclude_spec.match_file(rel_str):
-                # Check .coderagfilter include (! rules override exclude rules)
-                if not (
-                    coderag_include_spec and coderag_include_spec.match_file(rel_str)
-                ):
-                    continue
-
-        # (e) CLI --include: if specified, file must match
-        if cli_include_spec and not cli_include_spec.match_file(rel_str):
-            continue
-        # CLI --exclude: always respected
-        if cli_exclude_spec and cli_exclude_spec.match_file(rel_str):
-            continue
-
-        # Large file guard — code files are never skipped by size
-        try:
-            size = entry.stat().st_size
-        except OSError:
-            continue
-
-        file_lang = detect_language(entry, config.custom_type_mappings)
-
-        # Skip files with unrecognised extensions — they would be classified
-        # as "unknown" in the pipeline and discarded anyway.  Skipping early
-        # avoids unnecessary I/O (reading bytes for binary detection, hashing).
-        if file_lang is None:
-            continue
-
-        is_code = file_lang in _CODE_LANGUAGES
-
-        if size > _MAX_FILE_SIZE and not is_code:
-            print(f"Warning: skipping large non-code file ({size} bytes): {rel}")
-            continue
-
-        # Binary detection (empty files pass through)
-        if size > 0:
+            # Symlink cycle detection
             try:
-                chunk = entry.read_bytes()[:_BINARY_CHECK_SIZE]
-                if b"\x00" in chunk:
-                    continue
+                resolved = entry.resolve()
+            except OSError:
+                continue
+            if resolved in visited:
+                continue
+            visited.add(resolved)
+
+            # Relative path for pattern matching (use forward-slash string)
+            rel = entry.relative_to(repo_path)
+            parts = rel.parts
+
+            # (a) Skip hidden directories
+            if any(p.startswith(".") and p != "." for p in parts[:-1]):
+                continue
+
+            # (b) Skip junk directories
+            if any(p in _JUNK_DIRS for p in parts[:-1]):
+                continue
+
+            # Use forward-slash relative string for pathspec matching
+            rel_str = rel.as_posix()
+
+            # CLI --include is the highest-priority override: if specified and matches,
+            # the file is included regardless of .gitignore/.coderagfilter excludes.
+            force_included = cli_include_spec and cli_include_spec.match_file(rel_str)
+
+            if not force_included:
+                # (c) .gitignore
+                if gitignore_spec and gitignore_spec.match_file(rel_str):
+                    # Check .coderagfilter include (re-include overrides .gitignore)
+                    if not (
+                        coderag_include_spec
+                        and coderag_include_spec.match_file(rel_str)
+                    ):
+                        continue
+
+                # (d) .coderagfilter excludes
+                if coderag_exclude_spec and coderag_exclude_spec.match_file(rel_str):
+                    # Check .coderagfilter include (! rules override exclude rules)
+                    if not (
+                        coderag_include_spec
+                        and coderag_include_spec.match_file(rel_str)
+                    ):
+                        continue
+
+            # (e) CLI --include: if specified, file must match
+            if cli_include_spec and not cli_include_spec.match_file(rel_str):
+                continue
+            # CLI --exclude: always respected
+            if cli_exclude_spec and cli_exclude_spec.match_file(rel_str):
+                continue
+
+            # Large file guard — code files are never skipped by size
+            try:
+                size = entry.stat().st_size
             except OSError:
                 continue
 
-        result.append(rel)
+            file_lang = detect_language(entry, config.custom_type_mappings)
+
+            # Skip files with unrecognised extensions — they would be classified
+            # as "unknown" in the pipeline and discarded anyway.  Skipping early
+            # avoids unnecessary I/O (reading bytes for binary detection, hashing).
+            if file_lang is None:
+                continue
+
+            is_code = file_lang in _CODE_LANGUAGES
+
+            if size > _MAX_FILE_SIZE and not is_code:
+                print(f"Warning: skipping large non-code file ({size} bytes): {rel}")
+                continue
+
+            # Binary detection (empty files pass through)
+            if size > 0:
+                try:
+                    chunk = entry.read_bytes()[:_BINARY_CHECK_SIZE]
+                    if b"\x00" in chunk:
+                        continue
+                except OSError:
+                    continue
+
+            result.append(rel)
+            pbar.set_postfix(found=len(result), refresh=False)
+    finally:
+        pbar.close()
 
     result.sort()
     return result
