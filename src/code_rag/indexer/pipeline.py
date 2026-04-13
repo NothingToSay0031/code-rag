@@ -42,7 +42,11 @@ class IndexPipeline:
         self._vector_db_path = self._data_dir / "vectors.db"
         self._vector_db_path.touch(exist_ok=True)
 
-        self._embedder = Embedder(config.model_name, config.resolve_device())
+        self._embedder = Embedder(
+            config.model_name,
+            config.resolve_device(),
+            max_seq_length=config.max_chunk_tokens,
+        )
         # Set the real tokenizer for accurate token counting in chunker
         set_tokenizer(self._embedder.tokenizer)
         self._vector_store = VectorStore(self._vector_db_path, self._embedder.dimension)
@@ -53,7 +57,7 @@ class IndexPipeline:
         self,
         include_patterns: list[str] | None = None,
         exclude_patterns: list[str] | None = None,
-        checkpoint_every: int = 100_000,
+        checkpoint_every: int = 5_000,
     ) -> IndexStats:
         """Run the indexing pipeline with checkpoint/resume support.
 
@@ -61,7 +65,7 @@ class IndexPipeline:
             checkpoint_every: Max chunks per embedding checkpoint batch.
                 After each batch, metadata + bm25 + vectors are persisted so
                 the process can resume from the last checkpoint on crash.
-                Default is 100k chunks.
+                Default is 5k chunks.
         """
         start = time.time()
 

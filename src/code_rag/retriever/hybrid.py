@@ -92,6 +92,10 @@ class HybridRetriever:
         # Sort by RRF score descending, apply path filter, slice to top_k
         sorted_keys = sorted(rrf_scores, key=lambda k: rrf_scores[k], reverse=True)
 
+        # Normalise RRF scores to [0, 1] so callers see intuitive values.
+        # Maximum theoretical RRF score = two retrievers both rank the chunk #1.
+        _rrf_max = 2.0 / (_RRF_K + 1)
+
         output: list[SearchResult] = []
         for k in sorted_keys:
             if excl and _path_matches_any(result_map[k].chunk.file_path, excl):
@@ -99,7 +103,7 @@ class HybridRetriever:
             output.append(
                 SearchResult(
                     chunk=result_map[k].chunk,
-                    score=rrf_scores[k],
+                    score=rrf_scores[k] / _rrf_max,
                     source="hybrid",
                 )
             )

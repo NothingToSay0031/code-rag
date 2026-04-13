@@ -47,19 +47,27 @@ class MetadataStore:
     def get_symbols(self, file_path: str) -> list[SymbolInfo]:
         return self._symbols.get(file_path, [])
 
-    def find_symbol(self, symbol_name: str, *, limit: int = 200) -> list[SymbolInfo]:
+    def find_symbol(
+        self, symbol_name: str, *, limit: int = 200, exact_only: bool = False
+    ) -> list[SymbolInfo]:
         """Search symbols by name (case-insensitive).
 
         Uses an inverted name index for O(1) exact match.  Falls back to
         linear scan only for substring matches.  Exact matches are returned
         first.
+
+        Args:
+            symbol_name: Symbol name to search for.
+            limit: Maximum number of results to return.
+            exact_only: When True, only return exact name matches (case-insensitive).
+                        Skips the O(N) substring scan entirely.
         """
         query = symbol_name.lower()
 
         # O(1) exact match via inverted index
         exact = list(self._name_index.get(query, []))
 
-        if len(exact) >= limit:
+        if exact_only or len(exact) >= limit:
             return exact[:limit]
 
         # O(N) substring scan for partial matches (skip exact dupes)

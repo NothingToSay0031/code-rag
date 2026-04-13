@@ -24,7 +24,7 @@ curl -sSfL https://raw.githubusercontent.com/NothingToSay0031/code-rag/master/in
 
 ```bash
 # 1. Index a repository
-code-rag init "path/to/your/project" --include "Engine/Shaders/**" --include "Engine/Sources/**" --exclude "Engine/Sources/External/**"
+code-rag init path/to/your/project
 
 # 2. Open the project in your AI agent
 #    → opencode.json are created automatically
@@ -65,6 +65,20 @@ code-rag setup-mcp [--global]      Write MCP config without re-indexing
 --exclude PATTERN   Exclude matching files (glob, repeatable)
 --device auto|cpu|cuda
 ```
+
+> **PowerShell users**: PowerShell expands glob patterns before passing them to `code-rag`, causing `--include` / `--exclude` to malfunction. Use a `.coderagfilter` file in the repo root instead — it is never touched by the shell:
+>
+> ```ini
+> # .coderagfilter
+> [include]
+> Engine/Shaders/**
+> Engine/Sources/**
+>
+> [exclude]
+> Engine/Sources/External/**
+> ```
+>
+> Then run `code-rag init` without any `--include` / `--exclude` flags.
 
 ---
 

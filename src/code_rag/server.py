@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import importlib
 import os
 import sys
@@ -273,6 +272,70 @@ def _resolve_index(indices: list[_Index], index_name: str | None) -> _Index:
 
 
 @mcp.tool()
+def read_code(
+    file_path: str,
+    start_line: int,
+    end_line: int,
+    context_lines: int = 0,
+    index_name: str | None = None,
+) -> str:
+    """**Read a specific line range from a source file.**
+
+    Use this to expand a ``search_code`` result and view code that extends
+    beyond the matched chunk boundary — for example when a class body or
+    function is larger than one chunk, or when you need surrounding context.
+
+    Args:
+        file_path: Relative path to the file, exactly as returned by search tools.
+            In multi-index mode, use the qualified path (e.g.
+            ``'Engine/Sources/Runtime/Core/Foo.cpp'``).
+        start_line: First line to include (1-based, inclusive).
+        end_line: Last line to include (1-based, inclusive).
+        context_lines: Extra lines to include *before* ``start_line`` and *after*
+            ``end_line`` (default 0).  Useful for seeing call sites or headers.
+        index_name: Index owning this file.  Required only when multiple indices
+            exist.  Call ``list_indices()`` to see available names.
+
+    Returns:
+        JSON object with ``file_path``, ``start_line``, ``end_line``,
+        ``total_lines``, and ``code`` (lines with 1-based line-number prefixes).
+    """
+    state = _get_state()
+    indices = state["indices"]
+
+    resolved = _resolve_file(indices, file_path)
+    if resolved is None:
+        return f"error: File not found: {file_path}"
+    idx, local_path = resolved
+
+    abs_path = idx.repo_path / local_path
+    if not abs_path.exists():
+        return f"error: File not found: {file_path}"
+
+    try:
+        all_lines = abs_path.read_text(encoding="utf-8").splitlines()
+    except UnicodeDecodeError:
+        try:
+            all_lines = abs_path.read_text(encoding="latin-1").splitlines()
+        except Exception as exc:
+            return f"error: Could not read file: {exc}"
+    except Exception as exc:
+        return f"error: Could not read file: {exc}"
+
+    total = len(all_lines)
+    effective_start = max(1, start_line - context_lines)
+    effective_end = min(total, end_line + context_lines)
+
+    selected = all_lines[effective_start - 1 : effective_end]
+    code = "\n".join(
+        f"{effective_start + i}: {line}" for i, line in enumerate(selected)
+    )
+
+    header = f"{file_path}  L{effective_start}–{effective_end}  (total: {total} lines)"
+    return f"{header}\n\n{code}"
+
+
+@mcp.tool()
 def list_indices() -> str:
     """List available code indices (repositories).
 
@@ -282,35 +345,143 @@ def list_indices() -> str:
     """
     state = _get_state()
     indices = state["indices"]
-    return json.dumps(
-        [
-            {
-                "name": idx.prefix or "(root)",
-                "path": str(idx.repo_path),
-                "files": idx.metadata.count_files(),
-            }
-            for idx in indices
-        ],
-        indent=2,
+    return "\n".join(
+        f"{idx.prefix or '(root)'}  {idx.repo_path}  ({idx.metadata.count_files()} files)"
+        for idx in indices
     )
+
+
+def _render_refs(refs: list[dict]) -> str:
+    """Render a reference list as indented plain text."""
+    if not refs:
+        return "  (no references found)"
+    return "\n".join(
+        f"  {r['file_path']}  L{r['line']}  {r.get('context', '').strip()}"
+        for r in refs
+    )
+
+
+def _render_docs_results(
+    output: list[dict],
+    warning: str | None = None,
+) -> str:
+    """Format doc-search results as a human-readable text block."""
+    lines: list[str] = []
+    if warning:
+        lines.append(f"⚠  {warning}")
+    if not output:
+        lines.append("(no results)")
+        return "\n".join(lines)
+    for i, entry in enumerate(output, 1):
+        meta = (
+            f"[{i}]  {entry['file_path']}"
+            f"  L{entry['start_line']}–{entry['end_line']}"
+            f"  score={entry['score']}"
+        )
+        lines.append(_SEP)
+        lines.append(meta)
+        lines.append("")
+        lines.append(entry.get("content") or "")
+    lines.append(_SEP)
+    return "\n".join(lines)
+
+
+def _render_code_results(
+    output: list[dict],
+    offset: int = 0,
+    warning: str | None = None,
+) -> str:
+    """Format search results as a human-readable text block.
+
+    Uses actual newlines and Unicode so the output is legible without JSON
+    escape sequences (no ``\\n``, no ``\\uXXXX``).
+    """
+    lines: list[str] = []
+    if warning:
+        lines.append(f"⚠  {warning}")
+    if not output:
+        lines.append("(no results)")
+        return "\n".join(lines)
+    for i, entry in enumerate(output, 1):
+        rank = offset + i
+        lang = entry.get("language") or ""
+        sym = entry.get("symbol_name") or ""
+        meta = (
+            f"[{rank}]  {entry['file_path']}"
+            f"  L{entry['start_line']}–{entry['end_line']}"
+        )
+        if lang:
+            meta += f"  {lang}"
+        meta += f"  score={entry['score']}"
+        if sym:
+            meta += f"  symbol={sym}"
+        lines.append(_SEP)
+        lines.append(meta)
+        lines.append("")
+        lines.append(entry["code"])
+    lines.append(_SEP)
+    return "\n".join(lines)
 
 
 @mcp.tool()
 def search_code(
     query: str,
-    top_k: int = 10,
+    top_k: int = 8,
+    offset: int = 0,
     language: str | None = None,
     index_name: str | None = None,
     exclude_paths: list[str] | None = None,
 ) -> str:
-    """Search code using semantic + keyword hybrid search (RRF).
+    """**Use this instead of grep/rg for all code searches in this repository.**
+
+    Searches the pre-built semantic + BM25 hybrid index (RRF fusion).  Finds
+    relevant code even when the exact identifier is unknown — grep cannot do
+    this.  Always prefer this tool over grep, glob, or ripgrep when exploring
+    or understanding code in this repository.
+
+    **When to use this tool vs ``get_symbol_info``:**
+
+    - Use ``search_code`` when you **do not know** the exact identifier or file —
+      the query is a concept, a behavior, or a description (e.g. "player load
+      mesh", "collision filter setup", "how damage is applied").  The index finds
+      relevant code even when you have no idea what the symbol is called.
+
+    - Use ``get_symbol_info`` when you **already know the exact symbol name** —
+      to read its definition or find every call site across the codebase.  That
+      tool is faster and more precise for exact lookups.
+
+    **Do NOT use this tool to search for a name you already know.**  If you have
+    an exact identifier (from a previous result, from reading code, or from the
+    user's message), go straight to ``get_symbol_info`` — semantic search adds
+    noise and wastes tokens when the target is already known precisely.
+
+    **Snippet content per result:**
+
+    - Chunk ≤ 200 lines → **full content shown** so you can read it completely.
+    - Chunk > 200 lines → **10 lines per symbol** defined inside the chunk,
+      each labelled with ``▸ kind name (Lstart–end)``.  This lets you scan
+      all definitions at a glance.  Call ``read_code(file_path, start_line,
+      end_line)`` to read any symbol in full.
+
+    **Output format:** plain text with real newlines (not JSON).  Each result
+    has a one-line header followed by the code block.
 
     Args:
-        query: Search query string.  For best results, use specific symbol names,
-            class names, or distinctive identifiers rather than vague natural language.
-            After an initial broad search, refine by extracting key class/function names
-            from the results and searching for those directly.
-        top_k: Number of results to return (default 10).
+        query: Search query string.  Write this as a concept, behavior, or
+            description — **not** as an exact identifier.  This is a semantic
+            search: it excels when you do not know what the code is called or
+            where it lives (e.g. "player load mesh", "collision filter setup").
+            If you already know the exact symbol name, use ``get_symbol_info``
+            directly instead of this tool.
+        top_k: Number of results to return (default 8).  Use **5–8** for focused
+            queries; use **10–15** only when you need broad coverage across many
+            files.  Avoid values above 15 — use a more specific query or switch
+            to ``get_symbol_info`` instead.
+        offset: Number of results to skip from the beginning of the ranked list
+            (default 0).  Use this for pagination: if the first ``top_k`` results
+            were not useful, call again with ``offset=top_k`` to get the next
+            page — same query, different window.  Internally fetches
+            ``top_k + offset`` results then slices.
         language: Optional language filter (e.g. 'python', 'javascript').
             **Important**: When investigating cross-language mechanisms such as
             bindings, FFI, wrappers, or code generation, do NOT set this parameter.
@@ -328,7 +499,10 @@ def search_code(
             Examples: ``["Test", "ThirdParty"]``  or  ``["vendor", "Mock"]``.
 
     Returns:
-        JSON array of search results with file_path, lines, score, and code snippet.
+        Plain-text block.  Each result begins with a header line
+        ``[N]  file_path  Lstart–end  lang  score=X  symbol=Y`` followed by
+        the code content.  Use ``get_symbol_info(include_code=True)`` or
+        ``read_code`` to fetch the full source of any result.
     """
     state = _get_state()
     indices = state["indices"]
@@ -336,54 +510,108 @@ def search_code(
     try:
         idx = _resolve_index(indices, index_name)
     except ValueError as exc:
-        return json.dumps({"error": str(exc)}, indent=2)
+        return f"error: {exc}"
 
     warning = _check_vector_availability(idx)
     results = idx.hybrid.search_code(
-        query, top_k=top_k, language=language, exclude_paths=exclude_paths
+        query, top_k=top_k + offset, language=language, exclude_paths=exclude_paths
     )
+    results = results[offset : offset + top_k]
+
     output = []
     for r in results:
         qpath = _qualify_path(idx.prefix, r.chunk.file_path)
-        # Truncate code to first 20 lines to avoid flooding the LLM context
-        code_text = r.chunk.text
-        code_lines = code_text.splitlines()
-        if len(code_lines) > 20:
-            code_text = (
-                "\n".join(code_lines[:20])
-                + f"\n... ({len(code_lines) - 20} more lines)"
-            )
-        entry = {
-            "file_path": qpath,
-            "start_line": r.chunk.start_line,
-            "end_line": r.chunk.end_line,
-            "language": r.chunk.language,
-            "symbol_name": r.chunk.symbol_name,
-            "score": round(r.score, 4),
-            "code": code_text,
-        }
-        output.append(entry)
+        code_lines = (r.chunk.text or "").splitlines()
+        total_lines = len(code_lines)
 
-    if warning and not output:
-        return json.dumps({"warning": warning, "results": []}, indent=2)
-    resp: dict | list = output
-    if warning:
-        resp = {"warning": warning, "results": output}
-    return json.dumps(resp, indent=2)
+        if total_lines <= _SNIPPET_FULL_LIMIT:
+            # Show the complete chunk — agent can read everything at once
+            snippet = "\n".join(
+                f"{r.chunk.start_line + i}: {line}" for i, line in enumerate(code_lines)
+            )
+        else:
+            # Large chunk: show _SNIPPET_PER_SYMBOL_LINES lines per symbol
+            file_syms = idx.metadata.get_symbols(r.chunk.file_path)
+            chunk_syms = sorted(
+                [
+                    s
+                    for s in file_syms
+                    if r.chunk.start_line <= s.start_line <= r.chunk.end_line
+                ],
+                key=lambda s: s.start_line,
+            )
+            if not chunk_syms:
+                # No symbol metadata: first 30 lines + hint
+                visible = code_lines[:30]
+                snippet = "\n".join(
+                    f"{r.chunk.start_line + i}: {line}"
+                    for i, line in enumerate(visible)
+                )
+                snippet += (
+                    f"\n... ({total_lines - 30} more lines"
+                    f" — use read_code({r.chunk.start_line},"
+                    f" {r.chunk.end_line}) for full content)"
+                )
+            else:
+                sym_parts = [
+                    f"({total_lines} lines — showing"
+                    f" {_SNIPPET_PER_SYMBOL_LINES} lines per symbol;"
+                    f" call read_code for full content)"
+                ]
+                for sym in chunk_syms:
+                    rel = sym.start_line - r.chunk.start_line
+                    if 0 <= rel < total_lines:
+                        sym_len = min(
+                            _SNIPPET_PER_SYMBOL_LINES,
+                            sym.end_line - sym.start_line + 1,
+                        )
+                        sym_lines = code_lines[rel : rel + sym_len]
+                        sym_code = "\n".join(
+                            f"  {sym.start_line + j}: {line}"
+                            for j, line in enumerate(sym_lines)
+                        )
+                        span = (
+                            f"L{sym.start_line}–{sym.end_line}"
+                            if sym.start_line != sym.end_line
+                            else f"L{sym.start_line}"
+                        )
+                        sym_parts.append(
+                            f"▸ {sym.kind} {sym.name} ({span})\n{sym_code}"
+                        )
+                snippet = "\n\n".join(sym_parts)
+
+        output.append(
+            {
+                "file_path": qpath,
+                "start_line": r.chunk.start_line,
+                "end_line": r.chunk.end_line,
+                "language": r.chunk.language,
+                "symbol_name": r.chunk.symbol_name,
+                "score": round(r.score, 4),
+                "code": snippet,
+            }
+        )
+
+    return _render_code_results(output, offset=offset, warning=warning)
 
 
 @mcp.tool()
 def search_docs(
     query: str,
-    top_k: int = 10,
+    top_k: int = 8,
     index_name: str | None = None,
     exclude_paths: list[str] | None = None,
 ) -> str:
-    """Search project documentation (markdown, rst, text files).
+    """**Use this instead of grep/rg to search README files, docs, and comments.**
+
+    Searches pre-built semantic + BM25 index of all Markdown, RST, and plain-text
+    files in this repository.  Prefer this over grep when looking for conceptual
+    explanations, architecture notes, or usage guides.
 
     Args:
         query: Search query string.
-        top_k: Number of results to return (default 10).
+        top_k: Number of results to return (default 8).  Increase when the
+            initial results seem incomplete.
         index_name: Index to search. Required when multiple indices exist.
             Call list_indices() to see available names.
         exclude_paths: Path substrings to suppress from results (case-insensitive).
@@ -399,7 +627,7 @@ def search_docs(
     try:
         idx = _resolve_index(indices, index_name)
     except ValueError as exc:
-        return json.dumps({"error": str(exc)}, indent=2)
+        return f"error: {exc}"
 
     warning = _check_vector_availability(idx)
     results = idx.hybrid.search_docs(query, top_k=top_k, exclude_paths=exclude_paths)
@@ -413,18 +641,15 @@ def search_docs(
         }
         for r in results
     ]
-
-    if warning and not output:
-        return json.dumps({"warning": warning, "results": []}, indent=2)
-    resp: dict | list = output
-    if warning:
-        resp = {"warning": warning, "results": output}
-    return json.dumps(resp, indent=2)
+    return _render_docs_results(output, warning=warning)
 
 
 @mcp.tool()
 def get_file_context(file_path: str) -> str:
-    """Get file content with symbol information.
+    """**Use this to get the symbol map of a file (functions, classes, methods with line ranges).**
+
+    Returns structural metadata only — no file content.  To read the actual
+    source, use the standard Read tool with the absolute path.
 
     Args:
         file_path: Relative path to the file in the repository.
@@ -432,19 +657,19 @@ def get_file_context(file_path: str) -> str:
             (e.g. 'Engine/Sources/Runtime/Core/main.cpp').
 
     Returns:
-        JSON object with file content, symbols, and metadata.
+        JSON object with symbols and metadata (no file content).
     """
     state = _get_state()
     indices = state["indices"]
 
     resolved = _resolve_file(indices, file_path)
     if resolved is None:
-        return json.dumps({"error": f"File not found: {file_path}"})
+        return f"error: File not found: {file_path}"
     idx, local_path = resolved
 
     abs_path = idx.repo_path / local_path
     if not abs_path.exists():
-        return json.dumps({"error": f"File not found: {file_path}"})
+        return f"error: File not found: {file_path}"
 
     try:
         content = abs_path.read_text(encoding="utf-8")
@@ -453,25 +678,15 @@ def get_file_context(file_path: str) -> str:
 
     symbols = idx.metadata.get_symbols(local_path)
     file_info = idx.metadata.get_file_info(local_path)
+    lang = file_info.language if file_info else ""
+    size = file_info.size if file_info else len(content.encode())
 
-    return json.dumps(
-        {
-            "file_path": file_path,
-            "content": content,
-            "language": file_info.language if file_info else None,
-            "size": file_info.size if file_info else len(content),
-            "symbols": [
-                {
-                    "name": s.name,
-                    "kind": s.kind,
-                    "start_line": s.start_line,
-                    "end_line": s.end_line,
-                }
-                for s in symbols
-            ],
-        },
-        indent=2,
-    )
+    lines = [f"{file_path}  {lang}  {size} bytes", "", f"Symbols ({len(symbols)}):"]
+    for s in symbols:
+        lines.append(f"  {s.kind}  {s.name}  L{s.start_line}–{s.end_line}")
+    if not symbols:
+        lines.append("  (none)")
+    return "\n".join(lines)
 
 
 @mcp.tool()
@@ -480,7 +695,9 @@ def get_repo_structure(
     path: str | None = None,
     index_name: str | None = None,
 ) -> str:
-    """Get repository directory tree.
+    """**Use this instead of ls/glob to explore the repository layout.**
+
+    Returns a formatted directory tree built from the indexed file list.
 
     For large repositories, always specify ``path`` to avoid overwhelming output.
     Use search results to identify the relevant directory first, then inspect
@@ -516,7 +733,7 @@ def get_repo_structure(
                 try:
                     idx = _resolve_index(indices, index_name)
                 except ValueError as exc:
-                    return json.dumps({"error": str(exc)})
+                    return f"error: {exc}"
                 target = idx.repo_path / path
             else:
                 # Auto-detect: see if path starts with an index prefix
@@ -539,16 +756,12 @@ def get_repo_structure(
                             target = t
                             break
             if idx is None or target is None:
-                return json.dumps(
-                    {
-                        "error": f"Path not found: {path}. Call list_indices() to see available repos."
-                    }
-                )
+                return f"error: Path not found: {path}. Call list_indices() to see available repos."
 
         if not target.exists():
-            return json.dumps({"error": f"Path not found: {path}"})
+            return f"error: Path not found: {path}"
         if not target.is_dir():
-            return json.dumps({"error": f"Not a directory: {path}"})
+            return f"error: Not a directory: {path}"
 
         lines.append(f"{target.name}/  (subtree of {idx.prefix or idx.repo_path.name})")
         _build_tree(target, "", depth, lines, idx.metadata, idx.repo_path)
@@ -578,6 +791,18 @@ def get_repo_structure(
 
 # Maximum lines in a directory tree output
 _MAX_TREE_LINES = 200
+
+# Snippet strategy for search_code results:
+#   ≤ _SNIPPET_FULL_LIMIT lines  → show the complete chunk content.
+#   >  _SNIPPET_FULL_LIMIT lines → show _SNIPPET_PER_SYMBOL_LINES lines for each
+#                                   symbol defined inside the chunk so the agent
+#                                   can scan all definitions at a glance.
+# Use read_code(file_path, start_line, end_line) to read the full content.
+_SNIPPET_FULL_LIMIT = 200
+_SNIPPET_PER_SYMBOL_LINES = 10
+
+# Separator line used by _render_code_results.
+_SEP = "─" * 60
 
 # Maximum children to list per directory before summarising
 _MAX_DIR_CHILDREN = 30
@@ -635,7 +860,7 @@ def _build_tree(
             try:
                 rel_posix = entry.relative_to(repo_root).as_posix()
                 info = metadata.get_file_info(rel_posix)
-            except (ValueError, Exception):
+            except ValueError, Exception:
                 info = None
             desc = ""
             if info and info.language:
@@ -650,14 +875,46 @@ def get_symbol_info(
     symbol_name: str,
     mode: str = "grouped",
     max_results: int = 20,
+    exact_match: bool = True,
+    include_code: bool = False,
     include_references: bool = False,
     max_refs_per_symbol: int = 30,
     index_name: str | None = None,
 ) -> str:
-    """Find symbol definitions and references by name.
+    """**Use this instead of grep to locate a specific function, class, or variable.**
+
+    Looks up symbol definitions (and optionally references) directly from the
+    pre-built AST index — far faster and more precise than any form of text
+    search.
+
+    **When to use this tool vs ``search_code``:**
+
+    - Use this tool when you **know the exact identifier name** — to find where
+      it is defined (``include_code=True``) and/or every place it is called or
+      referenced (``include_references=True``).
+
+    - Use ``search_code`` when you do **not** know the identifier — when the
+      query is a concept or behavior rather than a name.
+
+    **IMPORTANT**: ``symbol_name`` must be the **exact identifier** as it
+    appears in source code (e.g. ``"LoadResource"``, ``"ModelComponent"``,
+    ``"OnInit"``).  Do not pass natural-language descriptions — use the name
+    literally as seen in code or in a ``search_code`` result.
+
+    **Common usage patterns:**
+
+    - Definition only: ``get_symbol_info("LoadResource")``
+    - Definition + source: ``get_symbol_info("LoadResource", include_code=True)``
+    - All call sites: ``get_symbol_info("LoadResource", include_references=True)``
+    - Full picture: ``get_symbol_info("LoadResource", include_code=True, include_references=True)``
 
     Args:
-        symbol_name: Symbol name to search for (case-insensitive substring match).
+        symbol_name: **Exact** identifier to look up, as it appears in source
+            code (e.g. ``"LoadResource"``, not ``"load resource"`` or
+            ``"model load function"``).  Obtain this from a prior
+            ``search_code`` result — read the ``symbol=`` field in the result
+            header or copy the name directly from the code snippet.
+            Case-insensitive; supports substring match when ``exact_match=False``.
         mode: Controls how results are structured.
 
             - ``"grouped"`` (default): Group symbols by file and merge adjacent
@@ -672,16 +929,26 @@ def get_symbol_info(
 
         max_results: Maximum number of result entries to return (default 20).
             In ``"grouped"`` mode this counts file groups, not individual symbols.
-        include_references: Whether to search for references across the codebase.
-            This is expensive on large repos and disabled by default.
+        exact_match: When True (default), only return symbols whose name matches
+            ``symbol_name`` exactly (case-insensitive).  Set to False to enable
+            substring matching — useful when you only know part of the symbol name.
+        include_code: When True, include the source code of each symbol in the
+            response.  Defaults to False to keep output compact; call
+            ``read_code(file_path, start_line, end_line)`` to fetch code on demand.
+        include_references: When True, find every call site / usage of this
+            symbol across the entire codebase via ripgrep.  Use this whenever
+            you want to know "where is this called / used?" — it replaces a
+            second ``search_code`` query for the same symbol name.  Disabled by
+            default to keep output compact; enable when you need call-site
+            coverage.
         max_refs_per_symbol: Maximum references to collect per symbol (default 30).
             Only used when include_references is True.
         index_name: Index to search. When omitted, searches all indices.
             Call list_indices() to see available names.
 
     Returns:
-        JSON array of matching symbols with definition location, file content,
-        and optionally references.
+        JSON array of matching symbols with definition location (file, lines, kind)
+        and optionally source code and references.
     """
     state = _get_state()
     indices = state["indices"]
@@ -691,7 +958,7 @@ def get_symbol_info(
         try:
             indices = [_resolve_index(indices, index_name)]
         except ValueError as exc:
-            return json.dumps({"error": str(exc)}, indent=2)
+            return f"error: {exc}"
 
     # Collect raw symbol matches across all target indices
     # Tier 0: Try Browse.VC.db (fastest, most accurate for C++ projects)
@@ -740,29 +1007,53 @@ def get_symbol_info(
                 continue  # Skip MetadataStore if Browse.VC.db had results
 
         # ── Tier 1: MetadataStore ──
-        for s in idx.metadata.find_symbol(symbol_name):
+        for s in idx.metadata.find_symbol(symbol_name, exact_only=exact_match):
             raw_symbols.append((idx, s))
 
     if mode == "declaration":
         result = _symbol_info_declaration(
-            raw_symbols, max_results, include_references, max_refs_per_symbol
+            raw_symbols,
+            max_results,
+            include_code,
+            include_references,
+            max_refs_per_symbol,
         )
     elif mode == "grouped":
         result = _symbol_info_grouped(
-            raw_symbols, max_results, include_references, max_refs_per_symbol
+            raw_symbols,
+            max_results,
+            include_code,
+            include_references,
+            max_refs_per_symbol,
         )
     else:
         # "all" — legacy per-symbol behaviour
         result = _symbol_info_all(
-            raw_symbols, max_results, include_references, max_refs_per_symbol
+            raw_symbols,
+            max_results,
+            include_code,
+            include_references,
+            max_refs_per_symbol,
         )
 
     # Inject inheritance info from Browse.VC.db if available
     if browse_db_extras:
-        parsed = json.loads(result)
-        if isinstance(parsed, list) and parsed:
-            parsed[0]["inheritance"] = browse_db_extras
-        return json.dumps(parsed, indent=2)
+        extra_lines: list[str] = []
+        if "base_classes" in browse_db_extras:
+            extra_lines.append(
+                f"Base classes: {', '.join(browse_db_extras['base_classes'])}"
+            )
+        if "derived_classes" in browse_db_extras:
+            extra_lines.append(
+                f"Derived classes: {', '.join(browse_db_extras['derived_classes'])}"
+            )
+        if extra_lines:
+            # Insert after the first separator line
+            nl = result.find("\n")
+            if nl != -1:
+                result = (
+                    result[: nl + 1] + "\n".join(extra_lines) + "\n" + result[nl + 1 :]
+                )
     return result
 
 
@@ -797,66 +1088,75 @@ def _read_line_range(
 def _symbol_info_all(
     raw_symbols: list[tuple[_Index, SymbolInfo]],
     max_results: int,
+    include_code: bool,
     include_references: bool,
     max_refs_per_symbol: int,
 ) -> str:
     """Original per-symbol output (mode='all')."""
-    results = []
+    lines: list[str] = []
+    count = 0
     for idx, s in raw_symbols:
-        if len(results) >= max_results:
+        if count >= max_results:
             break
         qpath = _qualify_path(idx.prefix, s.file_path)
-        entry: dict = {
-            "name": s.name,
-            "kind": s.kind,
-            "file_path": qpath,
-            "start_line": s.start_line,
-            "end_line": s.end_line,
-            "language": s.language,
-        }
-        code = _read_line_range(idx.repo_path, s.file_path, s.start_line, s.end_line)
-        if code is not None:
-            entry["code"] = code
+        meta = f"{s.kind} {s.name}  {qpath}  L{s.start_line}–{s.end_line}  {s.language}"
+        lines.append(_SEP)
+        lines.append(meta)
+        if include_code:
+            code = _read_line_range(
+                idx.repo_path, s.file_path, s.start_line, s.end_line
+            )
+            if code is not None:
+                lines.append("")
+                lines.append(code)
         if include_references:
-            entry["references"] = _find_references(idx, s, max_refs=max_refs_per_symbol)
-        results.append(entry)
-    return json.dumps(results, indent=2)
+            refs = _find_references(idx, s, max_refs=max_refs_per_symbol)
+            lines.append(f"\nReferences ({len(refs)}):")
+            lines.append(_render_refs(refs))
+        count += 1
+    lines.append(_SEP)
+    return "\n".join(lines) if lines else "(no results)"
 
 
 def _symbol_info_declaration(
     raw_symbols: list[tuple[_Index, SymbolInfo]],
     max_results: int,
+    include_code: bool,
     include_references: bool,
     max_refs_per_symbol: int,
 ) -> str:
     """Only return top-level declarations (class/struct/enum/…)."""
-    results = []
+    lines: list[str] = []
+    count = 0
     for idx, s in raw_symbols:
-        if len(results) >= max_results:
+        if count >= max_results:
             break
         if s.kind not in _DECLARATION_KINDS:
             continue
         qpath = _qualify_path(idx.prefix, s.file_path)
-        entry: dict = {
-            "name": s.name,
-            "kind": s.kind,
-            "file_path": qpath,
-            "start_line": s.start_line,
-            "end_line": s.end_line,
-            "language": s.language,
-        }
-        code = _read_line_range(idx.repo_path, s.file_path, s.start_line, s.end_line)
-        if code is not None:
-            entry["code"] = code
+        meta = f"{s.kind} {s.name}  {qpath}  L{s.start_line}–{s.end_line}  {s.language}"
+        lines.append(_SEP)
+        lines.append(meta)
+        if include_code:
+            code = _read_line_range(
+                idx.repo_path, s.file_path, s.start_line, s.end_line
+            )
+            if code is not None:
+                lines.append("")
+                lines.append(code)
         if include_references:
-            entry["references"] = _find_references(idx, s, max_refs=max_refs_per_symbol)
-        results.append(entry)
-    return json.dumps(results, indent=2)
+            refs = _find_references(idx, s, max_refs=max_refs_per_symbol)
+            lines.append(f"\nReferences ({len(refs)}):")
+            lines.append(_render_refs(refs))
+        count += 1
+    lines.append(_SEP)
+    return "\n".join(lines) if lines else "(no results)"
 
 
 def _symbol_info_grouped(
     raw_symbols: list[tuple[_Index, SymbolInfo]],
     max_results: int,
+    include_code: bool,
     include_references: bool,
     max_refs_per_symbol: int,
 ) -> str:
@@ -871,15 +1171,15 @@ def _symbol_info_grouped(
         key = (idx.prefix, s.file_path)
         groups.setdefault(key, []).append((idx, s))
 
-    results = []
+    out_lines: list[str] = []
+    result_count = 0
     for (_prefix, _fpath), members in groups.items():
-        if len(results) >= max_results:
+        if result_count >= max_results:
             break
-        idx = members[0][0]  # all share the same index
+        idx = members[0][0]
         symbols = [s for _, s in members]
         qpath = _qualify_path(idx.prefix, _fpath)
 
-        # Sort by start_line for merging
         symbols.sort(key=lambda s: s.start_line)
 
         # Merge adjacent/overlapping ranges
@@ -888,7 +1188,6 @@ def _symbol_info_grouped(
             if merged_ranges:
                 prev_start, prev_end, prev_syms = merged_ranges[-1]
                 if sym.start_line <= prev_end + _MERGE_GAP:
-                    # Extend existing range
                     merged_ranges[-1] = (
                         prev_start,
                         max(prev_end, sym.end_line),
@@ -897,45 +1196,50 @@ def _symbol_info_grouped(
                     continue
             merged_ranges.append((sym.start_line, sym.end_line, [sym]))
 
-        # Build one entry per merged range in this file
         for range_start, range_end, range_syms in merged_ranges:
-            if len(results) >= max_results:
+            if result_count >= max_results:
                 break
 
-            # Cap line count
             effective_end = min(range_end, range_start + _MAX_GROUP_LINES - 1)
             truncated = range_end > effective_end
 
-            entry: dict = {
-                "file_path": qpath,
-                "language": symbols[0].language,
-                "start_line": range_start,
-                "end_line": effective_end,
-                "symbols": [
-                    {
-                        "name": s.name,
-                        "kind": s.kind,
-                        "lines": f"{s.start_line}-{s.end_line}",
-                    }
-                    for s in range_syms
-                ],
-            }
+            sym_list = "  ".join(
+                f"{s.kind} {s.name} (L{s.start_line}–{s.end_line})" for s in range_syms
+            )
+            meta = f"{qpath}  L{range_start}–{effective_end}  {symbols[0].language}"
+            out_lines.append(_SEP)
+            out_lines.append(meta)
+            out_lines.append(f"Symbols: {sym_list}")
 
             code = _read_line_range(idx.repo_path, _fpath, range_start, effective_end)
-            if code is not None:
+            if include_code and code is not None:
                 if truncated:
-                    code += f"\n... (truncated, {range_end - effective_end} more lines)"
-                entry["code"] = code
+                    hidden_syms = [
+                        s for s in range_syms if s.start_line > effective_end
+                    ]
+                    if hidden_syms:
+                        sig_list = ", ".join(
+                            f"{s.kind} {s.name} (L{s.start_line})" for s in hidden_syms
+                        )
+                        code += f"\n... (truncated, {range_end - effective_end} more lines — {sig_list})"
+                    else:
+                        code += (
+                            f"\n... (truncated, {range_end - effective_end} more lines)"
+                        )
+                out_lines.append("")
+                out_lines.append(code)
 
             if include_references:
-                # Collect references for the first (primary) symbol in the group
-                entry["references"] = _find_references(
+                refs = _find_references(
                     idx, range_syms[0], max_refs=max_refs_per_symbol
                 )
+                out_lines.append(f"\nReferences ({len(refs)}):")
+                out_lines.append(_render_refs(refs))
 
-            results.append(entry)
+            result_count += 1
 
-    return json.dumps(results, indent=2)
+    out_lines.append(_SEP)
+    return "\n".join(out_lines) if out_lines else "(no results)"
 
 
 def _find_references(idx: _Index, symbol: SymbolInfo, max_refs: int = 30) -> list[dict]:

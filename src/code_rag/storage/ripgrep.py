@@ -110,7 +110,7 @@ def _find_references_rg(
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+    except subprocess.TimeoutExpired, FileNotFoundError, OSError:
         return None
 
     # Exit code 1 = no matches (not an error for rg)
@@ -131,9 +131,16 @@ def _find_references_rg(
             continue
 
         data = obj["data"]
-        abs_path = data["path"]["text"]
+        # rg uses {"text": "..."} for UTF-8 paths/lines and {"bytes": "..."} for
+        # binary or non-UTF-8 content.  Skip matches we cannot represent as text.
+        abs_path = data["path"].get("text")
+        if abs_path is None:
+            continue
         line_number = data["line_number"]
-        line_text = data["lines"]["text"].rstrip("\n")
+        line_text = data["lines"].get("text")
+        if line_text is None:
+            continue  # binary file match — skip
+        line_text = line_text.rstrip("\n")
 
         # Convert absolute path to relative
         try:

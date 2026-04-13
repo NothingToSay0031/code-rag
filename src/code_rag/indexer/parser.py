@@ -96,9 +96,13 @@ LANGUAGE_CONFIGS: dict[str, LanguageConfig] = {
         factory="language",
         node_types={
             "class": ["class_declaration"],
-            "method": ["method_declaration"],
+            "struct": ["struct_declaration"],
+            "enum": ["enum_declaration"],
             "interface": ["interface_declaration"],
             "namespace": ["namespace_declaration"],
+            "constructor": ["constructor_declaration"],
+            "method": ["method_declaration"],
+            "property": ["property_declaration"],
         },
         name_field="name",
     ),
@@ -311,7 +315,7 @@ def _normalize_python_docstring(text: str) -> str:
     stripped = text.strip()
     try:
         value = ast.literal_eval(stripped)
-    except (SyntaxError, ValueError):
+    except SyntaxError, ValueError:
         return stripped
     return value if isinstance(value, str) else stripped
 

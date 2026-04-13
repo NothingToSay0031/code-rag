@@ -67,8 +67,28 @@ def _sliding_window_words(
 def _sliding_window_tokenizer(
     text: str, max_tokens: int, overlap_fraction: float
 ) -> list[str]:
-    """Token-based sliding window using the real BPE/WordPiece tokenizer."""
-    token_ids = _tokenizer.encode(text, add_special_tokens=False)
+    """Token-based sliding window using the real BPE/WordPiece tokenizer.
+
+    Uses character offset mapping to extract original text spans rather than
+    re-decoding token IDs.  Decoding re-tokenised IDs inserts spaces between
+    subword pieces and corrupts non-ASCII characters (e.g. Chinese comments),
+    so the stored ``Chunk.text`` would differ from the real source code.
+
+    Falls back to ``tokenizer.decode()`` when offset mapping is unavailable
+    (slow / non-fast tokenizers).
+    """
+    # Prefer offset-mapping path: slice original text instead of decoding.
+    offsets: list[tuple[int, int]] | None = None
+    try:
+        encoding = _tokenizer(
+            text, add_special_tokens=False, return_offsets_mapping=True
+        )
+        token_ids: list[int] = encoding["input_ids"]
+        offsets = encoding["offset_mapping"]
+    except Exception:
+        # Slow tokenizer or model that doesn't support offset_mapping.
+        token_ids = _tokenizer.encode(text, add_special_tokens=False)
+
     if not token_ids:
         return [text] if text.strip() else []
 
@@ -76,8 +96,17 @@ def _sliding_window_tokenizer(
     step = max(1, window_size - int(window_size * overlap_fraction))
     windows: list[str] = []
     for i in range(0, len(token_ids), step):
-        window_ids = token_ids[i : i + window_size]
-        window_text = _tokenizer.decode(window_ids, skip_special_tokens=True)
+        end_idx = min(i + window_size, len(token_ids))
+        if offsets is not None:
+            # Slice original text using character-level token boundaries.
+            start_char = offsets[i][0]
+            end_char = offsets[end_idx - 1][1]
+            window_text = text[start_char:end_char]
+        else:
+            # Fallback: decode (may alter formatting/encoding for non-ASCII).
+            window_text = _tokenizer.decode(
+                token_ids[i:end_idx], skip_special_tokens=True
+            )
         if window_text.strip():
             windows.append(window_text)
         if i + window_size >= len(token_ids):
