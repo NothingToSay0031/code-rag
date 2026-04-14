@@ -128,7 +128,7 @@ def chunk_file(
     elif chunk_type == "doc":
         return chunk_docs(source, file_path, max_tokens)
     elif chunk_type == "config":
-        return chunk_config(source, file_path)
+        return chunk_config(source, file_path, max_tokens)
     return []
 
 
@@ -140,10 +140,12 @@ def chunk_code(
         tree = parse_file(source_bytes, language)
         nodes = get_ast_children(tree, source_bytes, language)
     except Exception:
-        # Fallback: treat as single chunk
+        # Parser failed — fall back to sliding window so we respect max_tokens
+        # rather than dumping the entire (potentially huge) file as one chunk.
+        windows = sliding_window_split(source, max_tokens)
         return [
             Chunk(
-                text=source,
+                text=w,
                 file_path=file_path,
                 start_line=1,
                 end_line=source.count("\n") + 1,
@@ -151,15 +153,18 @@ def chunk_code(
                 language=language,
                 symbol_name=None,
                 symbol_kind=None,
-                metadata={},
+                metadata={"window": i} if len(windows) > 1 else {},
             )
+            for i, w in enumerate(windows)
         ]
 
     if not nodes:
-        # No AST nodes found, treat whole file as one chunk
+        # No top-level AST nodes — apply sliding window instead of returning
+        # the whole file as a single unbounded chunk.
+        windows = sliding_window_split(source, max_tokens)
         return [
             Chunk(
-                text=source,
+                text=w,
                 file_path=file_path,
                 start_line=1,
                 end_line=source.count("\n") + 1,
@@ -167,8 +172,9 @@ def chunk_code(
                 language=language,
                 symbol_name=None,
                 symbol_kind=None,
-                metadata={},
+                metadata={"window": i} if len(windows) > 1 else {},
             )
+            for i, w in enumerate(windows)
         ]
 
     chunks = []
@@ -316,7 +322,7 @@ def chunk_docs(source: str, file_path: str, max_tokens: int) -> list[Chunk]:
     return chunks
 
 
-def chunk_config(source: str, file_path: str) -> list[Chunk]:
+def chunk_config(source: str, file_path: str, max_tokens: int = 512) -> list[Chunk]:
     import os
 
     ext = os.path.splitext(file_path)[1].lower()
@@ -327,16 +333,27 @@ def chunk_config(source: str, file_path: str) -> list[Chunk]:
         ".toml": "toml",
     }
     file_type = file_type_map.get(ext, os.path.basename(file_path).lower())
+    meta_base = {"file_type": file_type}
+    total_lines = source.count("\n") + 1
+
+    # Large config files (e.g. package-lock.json) can exceed the model's
+    # context window.  Apply the same sliding-window split used elsewhere.
+    if count_tokens(source) > max_tokens:
+        windows = sliding_window_split(source, max_tokens)
+    else:
+        windows = [source]
+
     return [
         Chunk(
-            text=source,
+            text=w,
             file_path=file_path,
             start_line=1,
-            end_line=source.count("\n") + 1,
+            end_line=total_lines,
             chunk_type="config",
             language=None,
             symbol_name=None,
             symbol_kind=None,
-            metadata={"file_type": file_type},
+            metadata={**meta_base, "window": i} if len(windows) > 1 else meta_base,
         )
+        for i, w in enumerate(windows)
     ]

@@ -279,26 +279,14 @@ def read_code(
     context_lines: int = 0,
     index_name: str | None = None,
 ) -> str:
-    """**Read a specific line range from a source file.**
-
-    Use this to expand a ``search_code`` result and view code that extends
-    beyond the matched chunk boundary — for example when a class body or
-    function is larger than one chunk, or when you need surrounding context.
+    """Read a line range from a source file. Use to expand search results or view code beyond chunk boundaries.
 
     Args:
-        file_path: Relative path to the file, exactly as returned by search tools.
-            In multi-index mode, use the qualified path (e.g.
-            ``'Engine/Sources/Runtime/Core/Foo.cpp'``).
-        start_line: First line to include (1-based, inclusive).
-        end_line: Last line to include (1-based, inclusive).
-        context_lines: Extra lines to include *before* ``start_line`` and *after*
-            ``end_line`` (default 0).  Useful for seeing call sites or headers.
-        index_name: Index owning this file.  Required only when multiple indices
-            exist.  Call ``list_indices()`` to see available names.
-
-    Returns:
-        JSON object with ``file_path``, ``start_line``, ``end_line``,
-        ``total_lines``, and ``code`` (lines with 1-based line-number prefixes).
+        file_path: Relative path as returned by search tools. In multi-index mode, use qualified path.
+        start_line: First line (1-based, inclusive).
+        end_line: Last line (1-based, inclusive).
+        context_lines: Extra lines before/after the range (default 0).
+        index_name: Multi-index only. See list_indices().
     """
     state = _get_state()
     indices = state["indices"]
@@ -337,12 +325,7 @@ def read_code(
 
 @mcp.tool()
 def list_indices() -> str:
-    """List available code indices (repositories).
-
-    Returns:
-        JSON array of index objects with name, path, and file count.
-        Use the ``name`` value as ``index_name`` in other search tools.
-    """
+    """List available code indices (repositories). Use returned names as index_name in other tools."""
     state = _get_state()
     indices = state["indices"]
     return "\n".join(
@@ -361,37 +344,12 @@ def _render_refs(refs: list[dict]) -> str:
     )
 
 
-def _render_docs_results(
-    output: list[dict],
-    warning: str | None = None,
-) -> str:
-    """Format doc-search results as a human-readable text block."""
-    lines: list[str] = []
-    if warning:
-        lines.append(f"⚠  {warning}")
-    if not output:
-        lines.append("(no results)")
-        return "\n".join(lines)
-    for i, entry in enumerate(output, 1):
-        meta = (
-            f"[{i}]  {entry['file_path']}"
-            f"  L{entry['start_line']}–{entry['end_line']}"
-            f"  score={entry['score']}"
-        )
-        lines.append(_SEP)
-        lines.append(meta)
-        lines.append("")
-        lines.append(entry.get("content") or "")
-    lines.append(_SEP)
-    return "\n".join(lines)
-
-
-def _render_code_results(
+def _render_results(
     output: list[dict],
     offset: int = 0,
     warning: str | None = None,
 ) -> str:
-    """Format search results as a human-readable text block.
+    """Format search results (code or doc) as a human-readable text block.
 
     Uses actual newlines and Unicode so the output is legible without JSON
     escape sequences (no ``\\n``, no ``\\uXXXX``).
@@ -418,9 +376,93 @@ def _render_code_results(
         lines.append(_SEP)
         lines.append(meta)
         lines.append("")
-        lines.append(entry["code"])
+        lines.append(entry["snippet"])
     lines.append(_SEP)
     return "\n".join(lines)
+
+
+def _build_snippet(
+    r: "SearchResult",
+    idx: "_Index",
+    top_k: int,
+    rank: int,
+) -> str:
+    """Build a display snippet for a single search result.
+
+    Applies adaptive line limits (see :func:`_adaptive_snippet_limits`):
+    - Code chunks: symbol-aware preview for large chunks.
+    - Doc chunks:  heading-line prefix + truncation hint for large chunks.
+    Both chunk types receive line-number prefixes.
+    """
+    snippet_full_limit, snippet_sym_lines = _adaptive_snippet_limits(top_k, rank)
+    code_lines = (r.chunk.text or "").splitlines()
+    total_lines = len(code_lines)
+
+    # Fast path: chunk fits within the adaptive limit — show everything.
+    if total_lines <= snippet_full_limit:
+        return "\n".join(
+            f"{r.chunk.start_line + i}: {line}" for i, line in enumerate(code_lines)
+        )
+
+    if r.chunk.chunk_type == "code":
+        # Large code chunk: show per-symbol previews when metadata is available.
+        file_syms = idx.metadata.get_symbols(r.chunk.file_path)
+        chunk_syms = sorted(
+            [
+                s
+                for s in file_syms
+                if r.chunk.start_line <= s.start_line <= r.chunk.end_line
+            ],
+            key=lambda s: s.start_line,
+        )
+        if not chunk_syms:
+            # No symbol metadata: first 30 lines + hint.
+            visible = code_lines[:30]
+            snippet = "\n".join(
+                f"{r.chunk.start_line + i}: {line}" for i, line in enumerate(visible)
+            )
+            snippet += (
+                f"\n... ({total_lines - 30} more lines"
+                f" — use read_code({r.chunk.start_line},"
+                f" {r.chunk.end_line}) for full content)"
+            )
+            return snippet
+        sym_parts = [
+            f"({total_lines} lines — showing"
+            f" {snippet_sym_lines} lines per symbol;"
+            f" call read_code for full content)"
+        ]
+        for sym in chunk_syms:
+            rel = sym.start_line - r.chunk.start_line
+            if 0 <= rel < total_lines:
+                sym_len = min(
+                    snippet_sym_lines,
+                    sym.end_line - sym.start_line + 1,
+                )
+                sym_lines = code_lines[rel : rel + sym_len]
+                sym_code = "\n".join(
+                    f"  {sym.start_line + j}: {line}"
+                    for j, line in enumerate(sym_lines)
+                )
+                span = (
+                    f"L{sym.start_line}–{sym.end_line}"
+                    if sym.start_line != sym.end_line
+                    else f"L{sym.start_line}"
+                )
+                sym_parts.append(f"▸ {sym.kind} {sym.name} ({span})\n{sym_code}")
+        return "\n\n".join(sym_parts)
+    else:
+        # Large doc chunk: first snippet_full_limit lines + truncation hint.
+        visible = code_lines[:snippet_full_limit]
+        snippet = "\n".join(
+            f"{r.chunk.start_line + i}: {line}" for i, line in enumerate(visible)
+        )
+        snippet += (
+            f"\n... ({total_lines - snippet_full_limit} more lines"
+            f" — use read_code({r.chunk.start_line},"
+            f" {r.chunk.end_line}) for full content)"
+        )
+        return snippet
 
 
 @mcp.tool()
@@ -432,77 +474,19 @@ def search_code(
     index_name: str | None = None,
     exclude_paths: list[str] | None = None,
 ) -> str:
-    """**Use this instead of grep/rg for all code searches in this repository.**
+    """Semantic + BM25 hybrid code search. Use for concept/behavior queries when the exact symbol name is unknown. If you already know the identifier, use get_symbol_info instead.
 
-    Searches the pre-built semantic + BM25 hybrid index (RRF fusion).  Finds
-    relevant code even when the exact identifier is unknown — grep cannot do
-    this.  Always prefer this tool over grep, glob, or ripgrep when exploring
-    or understanding code in this repository.
+    Expensive (two retrieval passes). Read all results before calling again; use read_code to expand truncated snippets; use offset to paginate.
 
-    **When to use this tool vs ``get_symbol_info``:**
-
-    - Use ``search_code`` when you **do not know** the exact identifier or file —
-      the query is a concept, a behavior, or a description (e.g. "player load
-      mesh", "collision filter setup", "how damage is applied").  The index finds
-      relevant code even when you have no idea what the symbol is called.
-
-    - Use ``get_symbol_info`` when you **already know the exact symbol name** —
-      to read its definition or find every call site across the codebase.  That
-      tool is faster and more precise for exact lookups.
-
-    **Do NOT use this tool to search for a name you already know.**  If you have
-    an exact identifier (from a previous result, from reading code, or from the
-    user's message), go straight to ``get_symbol_info`` — semantic search adds
-    noise and wastes tokens when the target is already known precisely.
-
-    **Snippet content per result:**
-
-    - Chunk ≤ 200 lines → **full content shown** so you can read it completely.
-    - Chunk > 200 lines → **10 lines per symbol** defined inside the chunk,
-      each labelled with ``▸ kind name (Lstart–end)``.  This lets you scan
-      all definitions at a glance.  Call ``read_code(file_path, start_line,
-      end_line)`` to read any symbol in full.
-
-    **Output format:** plain text with real newlines (not JSON).  Each result
-    has a one-line header followed by the code block.
+    Snippet size scales with top_k: ≤3→200 ln, ≤5→150, ≤10→100, >10→80-100. Oversized chunks show per-symbol previews (▸ kind name L#). Use read_code to expand any result.
 
     Args:
-        query: Search query string.  Write this as a concept, behavior, or
-            description — **not** as an exact identifier.  This is a semantic
-            search: it excels when you do not know what the code is called or
-            where it lives (e.g. "player load mesh", "collision filter setup").
-            If you already know the exact symbol name, use ``get_symbol_info``
-            directly instead of this tool.
-        top_k: Number of results to return (default 8).  Use **5–8** for focused
-            queries; use **10–15** only when you need broad coverage across many
-            files.  Avoid values above 15 — use a more specific query or switch
-            to ``get_symbol_info`` instead.
-        offset: Number of results to skip from the beginning of the ranked list
-            (default 0).  Use this for pagination: if the first ``top_k`` results
-            were not useful, call again with ``offset=top_k`` to get the next
-            page — same query, different window.  Internally fetches
-            ``top_k + offset`` results then slices.
-        language: Optional language filter (e.g. 'python', 'javascript').
-            **Important**: When investigating cross-language mechanisms such as
-            bindings, FFI, wrappers, or code generation, do NOT set this parameter.
-            For example, Python bindings in a C++ engine are implemented in C++,
-            so filtering by 'python' would miss all the relevant code.
-            Only use this filter when you are certain the results should be in
-            one specific language.
-        index_name: Index to search. Required when multiple indices exist.
-            Call list_indices() to see available names.
-        exclude_paths: Path substrings to suppress from results (case-insensitive).
-            Results whose ``file_path`` contains any of these strings are excluded.
-            Default (``null``) suppresses files whose path contains ``"Test"``,
-            preventing large test suites from drowning out production code.
-            Pass ``[]`` to disable all path filtering.
-            Examples: ``["Test", "ThirdParty"]``  or  ``["vendor", "Mock"]``.
-
-    Returns:
-        Plain-text block.  Each result begins with a header line
-        ``[N]  file_path  Lstart–end  lang  score=X  symbol=Y`` followed by
-        the code content.  Use ``get_symbol_info(include_code=True)`` or
-        ``read_code`` to fetch the full source of any result.
+        query: Concept/behavior description, not an exact identifier.
+        top_k: Results to return (default 8). Lower top_k → more lines per result. Max useful value is 15.
+        offset: Skip N results for pagination (default 0).
+        language: Language filter. Omit for cross-language queries (e.g. C++ bindings, FFI, codegen).
+        index_name: Multi-index only. See list_indices().
+        exclude_paths: Path substrings to exclude. Default excludes "Test". Pass [] to disable.
     """
     state = _get_state()
     indices = state["indices"]
@@ -518,108 +502,40 @@ def search_code(
     )
     results = results[offset : offset + top_k]
 
-    output = []
-    for r in results:
-        qpath = _qualify_path(idx.prefix, r.chunk.file_path)
-        code_lines = (r.chunk.text or "").splitlines()
-        total_lines = len(code_lines)
+    output = [
+        {
+            "file_path": _qualify_path(idx.prefix, r.chunk.file_path),
+            "start_line": r.chunk.start_line,
+            "end_line": r.chunk.end_line,
+            "language": r.chunk.language,
+            "symbol_name": r.chunk.symbol_name,
+            "score": round(r.score, 4),
+            "snippet": _build_snippet(r, idx, top_k, rank),
+        }
+        for rank, r in enumerate(results)
+    ]
 
-        if total_lines <= _SNIPPET_FULL_LIMIT:
-            # Show the complete chunk — agent can read everything at once
-            snippet = "\n".join(
-                f"{r.chunk.start_line + i}: {line}" for i, line in enumerate(code_lines)
-            )
-        else:
-            # Large chunk: show _SNIPPET_PER_SYMBOL_LINES lines per symbol
-            file_syms = idx.metadata.get_symbols(r.chunk.file_path)
-            chunk_syms = sorted(
-                [
-                    s
-                    for s in file_syms
-                    if r.chunk.start_line <= s.start_line <= r.chunk.end_line
-                ],
-                key=lambda s: s.start_line,
-            )
-            if not chunk_syms:
-                # No symbol metadata: first 30 lines + hint
-                visible = code_lines[:30]
-                snippet = "\n".join(
-                    f"{r.chunk.start_line + i}: {line}"
-                    for i, line in enumerate(visible)
-                )
-                snippet += (
-                    f"\n... ({total_lines - 30} more lines"
-                    f" — use read_code({r.chunk.start_line},"
-                    f" {r.chunk.end_line}) for full content)"
-                )
-            else:
-                sym_parts = [
-                    f"({total_lines} lines — showing"
-                    f" {_SNIPPET_PER_SYMBOL_LINES} lines per symbol;"
-                    f" call read_code for full content)"
-                ]
-                for sym in chunk_syms:
-                    rel = sym.start_line - r.chunk.start_line
-                    if 0 <= rel < total_lines:
-                        sym_len = min(
-                            _SNIPPET_PER_SYMBOL_LINES,
-                            sym.end_line - sym.start_line + 1,
-                        )
-                        sym_lines = code_lines[rel : rel + sym_len]
-                        sym_code = "\n".join(
-                            f"  {sym.start_line + j}: {line}"
-                            for j, line in enumerate(sym_lines)
-                        )
-                        span = (
-                            f"L{sym.start_line}–{sym.end_line}"
-                            if sym.start_line != sym.end_line
-                            else f"L{sym.start_line}"
-                        )
-                        sym_parts.append(
-                            f"▸ {sym.kind} {sym.name} ({span})\n{sym_code}"
-                        )
-                snippet = "\n\n".join(sym_parts)
-
-        output.append(
-            {
-                "file_path": qpath,
-                "start_line": r.chunk.start_line,
-                "end_line": r.chunk.end_line,
-                "language": r.chunk.language,
-                "symbol_name": r.chunk.symbol_name,
-                "score": round(r.score, 4),
-                "code": snippet,
-            }
-        )
-
-    return _render_code_results(output, offset=offset, warning=warning)
+    return _render_results(output, offset=offset, warning=warning)
 
 
 @mcp.tool()
 def search_docs(
     query: str,
     top_k: int = 8,
+    offset: int = 0,
     index_name: str | None = None,
     exclude_paths: list[str] | None = None,
 ) -> str:
-    """**Use this instead of grep/rg to search README files, docs, and comments.**
+    """Semantic + BM25 search over Markdown, RST, and text documentation files.
 
-    Searches pre-built semantic + BM25 index of all Markdown, RST, and plain-text
-    files in this repository.  Prefer this over grep when looking for conceptual
-    explanations, architecture notes, or usage guides.
+    Snippet size scales with top_k: ≤3→200 ln, ≤5→150, ≤10→100, >10→80-100. Oversized sections are truncated with a read_code hint. Use offset to paginate.
 
     Args:
-        query: Search query string.
-        top_k: Number of results to return (default 8).  Increase when the
-            initial results seem incomplete.
-        index_name: Index to search. Required when multiple indices exist.
-            Call list_indices() to see available names.
-        exclude_paths: Path substrings to suppress from results (case-insensitive).
-            Default (``null``) suppresses files whose path contains ``"Test"``.
-            Pass ``[]`` to disable all path filtering.
-
-    Returns:
-        JSON array of search results with file_path, lines, score, and content.
+        query: Search query.
+        top_k: Number of results (default 8). Lower top_k → more lines per result.
+        offset: Skip N results for pagination (default 0).
+        index_name: Multi-index only. See list_indices().
+        exclude_paths: Path substrings to exclude. Default excludes "Test". Pass [] to disable.
     """
     state = _get_state()
     indices = state["indices"]
@@ -630,34 +546,30 @@ def search_docs(
         return f"error: {exc}"
 
     warning = _check_vector_availability(idx)
-    results = idx.hybrid.search_docs(query, top_k=top_k, exclude_paths=exclude_paths)
+    results = idx.hybrid.search_docs(
+        query, top_k=top_k + offset, exclude_paths=exclude_paths
+    )
+    results = results[offset : offset + top_k]
+
     output = [
         {
             "file_path": _qualify_path(idx.prefix, r.chunk.file_path),
             "start_line": r.chunk.start_line,
             "end_line": r.chunk.end_line,
             "score": round(r.score, 4),
-            "content": r.chunk.text,
+            "snippet": _build_snippet(r, idx, top_k, rank),
         }
-        for r in results
+        for rank, r in enumerate(results)
     ]
-    return _render_docs_results(output, warning=warning)
+    return _render_results(output, offset=offset, warning=warning)
 
 
 @mcp.tool()
-def get_file_context(file_path: str) -> str:
-    """**Use this to get the symbol map of a file (functions, classes, methods with line ranges).**
-
-    Returns structural metadata only — no file content.  To read the actual
-    source, use the standard Read tool with the absolute path.
+def get_file_symbols(file_path: str) -> str:
+    """Get the symbol map of a file (functions, classes, methods with line ranges). Returns metadata only, no source code. Use read_code to view actual source.
 
     Args:
-        file_path: Relative path to the file in the repository.
-            In multi-index mode, use the qualified path returned by search
-            (e.g. 'Engine/Sources/Runtime/Core/main.cpp').
-
-    Returns:
-        JSON object with symbols and metadata (no file content).
+        file_path: Relative path. In multi-index mode, use qualified path from search results.
     """
     state = _get_state()
     indices = state["indices"]
@@ -695,25 +607,12 @@ def get_repo_structure(
     path: str | None = None,
     index_name: str | None = None,
 ) -> str:
-    """**Use this instead of ls/glob to explore the repository layout.**
-
-    Returns a formatted directory tree built from the indexed file list.
-
-    For large repositories, always specify ``path`` to avoid overwhelming output.
-    Use search results to identify the relevant directory first, then inspect
-    its structure with this tool.
+    """Get directory tree from the indexed file list. For large repos, always specify path to avoid truncation.
 
     Args:
-        depth: Maximum depth of directory tree (default 3).
-        path: Subdirectory path to inspect (e.g. 'Engine/Sources/Runtime/Plugins/Python').
-            When omitted, shows the repository root — but for large repos this will be
-            truncated.  Prefer specifying a path.
-        index_name: Index to inspect. Required when multiple indices exist.
-            Call list_indices() to see available names.
-
-    Returns:
-        Formatted directory tree string.  Large directories are summarised
-        to keep the output compact.
+        depth: Max tree depth (default 3).
+        path: Subdirectory to inspect (e.g. 'Engine/Sources/Runtime'). Omit for root.
+        index_name: Multi-index only. See list_indices().
     """
     state = _get_state()
     indices = state["indices"]
@@ -792,14 +691,44 @@ def get_repo_structure(
 # Maximum lines in a directory tree output
 _MAX_TREE_LINES = 200
 
-# Snippet strategy for search_code results:
-#   ≤ _SNIPPET_FULL_LIMIT lines  → show the complete chunk content.
-#   >  _SNIPPET_FULL_LIMIT lines → show _SNIPPET_PER_SYMBOL_LINES lines for each
-#                                   symbol defined inside the chunk so the agent
-#                                   can scan all definitions at a glance.
+# Snippet strategy for search_code results — adaptive to top_k:
+#   top_k ≤  3                  → full_limit=200, per_symbol=15
+#   top_k ≤  5                  → full_limit=150, per_symbol=10
+#   top_k ≤ 10                  → full_limit=100, per_symbol= 5
+#   top_k > 10, rank <  10      → full_limit=100, per_symbol= 5
+#   top_k > 10, rank >= 10      → full_limit= 80, per_symbol= 5
+# These constants are the base values (top_k ≤ 3); see _adaptive_snippet_limits().
 # Use read_code(file_path, start_line, end_line) to read the full content.
 _SNIPPET_FULL_LIMIT = 200
-_SNIPPET_PER_SYMBOL_LINES = 10
+_SNIPPET_PER_SYMBOL_LINES = 15
+
+
+def _adaptive_snippet_limits(top_k: int, rank: int) -> tuple[int, int]:
+    """Return *(full_limit, per_symbol_lines)* based on query breadth and result rank.
+
+    Larger ``top_k`` → smaller snippets per result so total context stays bounded.
+
+    ============  =========  ================  ================
+    top_k         rank       full_limit (ln)   per_symbol (ln)
+    ============  =========  ================  ================
+    ≤ 3           any        200               15
+    ≤ 5           any        150               10
+    ≤ 10          any        100                5
+    > 10          < 10       100                5
+    > 10          ≥ 10        80                5
+    ============  =========  ================  ================
+    """
+    if top_k <= 3:
+        return 200, 15
+    if top_k <= 5:
+        return 150, 10
+    if top_k <= 10:
+        return 100, 5
+    # top_k > 10: lower-ranked results get a tighter limit
+    if rank < 10:
+        return 100, 5
+    return 80, 5
+
 
 # Separator line used by _render_code_results.
 _SEP = "─" * 60
@@ -881,74 +810,25 @@ def get_symbol_info(
     max_refs_per_symbol: int = 30,
     index_name: str | None = None,
 ) -> str:
-    """**Use this instead of grep to locate a specific function, class, or variable.**
+    """Look up symbol definitions and references from the AST index. Use when you know the exact identifier name. For concept/behavior queries, use search_code instead.
 
-    Looks up symbol definitions (and optionally references) directly from the
-    pre-built AST index — far faster and more precise than any form of text
-    search.
+    symbol_name must be the literal identifier as it appears in source code — not a description.
 
-    **When to use this tool vs ``search_code``:**
-
-    - Use this tool when you **know the exact identifier name** — to find where
-      it is defined (``include_code=True``) and/or every place it is called or
-      referenced (``include_references=True``).
-
-    - Use ``search_code`` when you do **not** know the identifier — when the
-      query is a concept or behavior rather than a name.
-
-    **IMPORTANT**: ``symbol_name`` must be the **exact identifier** as it
-    appears in source code (e.g. ``"LoadResource"``, ``"ModelComponent"``,
-    ``"OnInit"``).  Do not pass natural-language descriptions — use the name
-    literally as seen in code or in a ``search_code`` result.
-
-    **Common usage patterns:**
-
-    - Definition only: ``get_symbol_info("LoadResource")``
-    - Definition + source: ``get_symbol_info("LoadResource", include_code=True)``
-    - All call sites: ``get_symbol_info("LoadResource", include_references=True)``
-    - Full picture: ``get_symbol_info("LoadResource", include_code=True, include_references=True)``
+    Common patterns:
+      get_symbol_info("LoadResource")                                           # definition only
+      get_symbol_info("LoadResource", include_code=True)                       # + source
+      get_symbol_info("LoadResource", include_references=True)                 # + all call sites
+      get_symbol_info("LoadResource", include_code=True, include_references=True)  # full picture
 
     Args:
-        symbol_name: **Exact** identifier to look up, as it appears in source
-            code (e.g. ``"LoadResource"``, not ``"load resource"`` or
-            ``"model load function"``).  Obtain this from a prior
-            ``search_code`` result — read the ``symbol=`` field in the result
-            header or copy the name directly from the code snippet.
-            Case-insensitive; supports substring match when ``exact_match=False``.
-        mode: Controls how results are structured.
-
-            - ``"grouped"`` (default): Group symbols by file and merge adjacent
-              implementations into consolidated code blocks.  For example, querying
-              a class name returns one entry for the header declaration and one
-              merged entry for the .cpp implementation file instead of dozens of
-              tiny individual method entries.
-            - ``"declaration"``: Only return top-level declarations
-              (class, struct, interface, enum).  Useful for getting an API overview
-              without implementation details.
-            - ``"all"``: Return every matching symbol individually (raw, ungrouped).
-
-        max_results: Maximum number of result entries to return (default 20).
-            In ``"grouped"`` mode this counts file groups, not individual symbols.
-        exact_match: When True (default), only return symbols whose name matches
-            ``symbol_name`` exactly (case-insensitive).  Set to False to enable
-            substring matching — useful when you only know part of the symbol name.
-        include_code: When True, include the source code of each symbol in the
-            response.  Defaults to False to keep output compact; call
-            ``read_code(file_path, start_line, end_line)`` to fetch code on demand.
-        include_references: When True, find every call site / usage of this
-            symbol across the entire codebase via ripgrep.  Use this whenever
-            you want to know "where is this called / used?" — it replaces a
-            second ``search_code`` query for the same symbol name.  Disabled by
-            default to keep output compact; enable when you need call-site
-            coverage.
-        max_refs_per_symbol: Maximum references to collect per symbol (default 30).
-            Only used when include_references is True.
-        index_name: Index to search. When omitted, searches all indices.
-            Call list_indices() to see available names.
-
-    Returns:
-        JSON array of matching symbols with definition location (file, lines, kind)
-        and optionally source code and references.
+        symbol_name: Exact identifier as in source code (e.g. "LoadResource"). Case-insensitive.
+        mode: "grouped" (default) merges adjacent symbols per file; "declaration" returns only class/struct/enum/interface; "all" returns every match individually.
+        max_results: Max entries (default 20). In grouped mode, counts file groups.
+        exact_match: True (default) for exact name match. False for substring matching.
+        include_code: Include source code of each symbol (default False). Use read_code for on-demand fetching.
+        include_references: Find all call sites/usages via ripgrep (default False). Replaces a second search_code call for the same name.
+        max_refs_per_symbol: Max references per symbol (default 30). Only when include_references=True.
+        index_name: Omit to search all indices. See list_indices().
     """
     state = _get_state()
     indices = state["indices"]

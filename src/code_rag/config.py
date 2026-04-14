@@ -16,7 +16,7 @@ class CodeRagConfig:
     data_dir: str = ".code-rag"
     model_name: str = "Qwen/Qwen3-Embedding-0.6B"
     device: str = "auto"
-    max_chunk_tokens: int = 8192
+    max_chunk_tokens: int = 4096
     custom_type_mappings: dict[str, str] = field(
         default_factory=lambda: {".glsl": "c", ".hlsl": "c", ".fx": "c"}
     )

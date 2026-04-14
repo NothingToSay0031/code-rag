@@ -111,6 +111,38 @@ class HybridRetriever:
                 break
         return output
 
+    def search_by_type(
+        self,
+        query: str,
+        chunk_type: str | None,
+        top_k: int = 10,
+        language: str | None = None,
+        exclude_paths: list[str] | None = None,
+    ) -> list[SearchResult]:
+        """Unified retrieval with optional chunk_type filter.
+
+        Args:
+            query: Search query string.
+            chunk_type: ``'code'``, ``'doc'``, or ``None`` (no type filter).
+            top_k: Maximum results to return.
+            language: Optional language filter (code chunks only).
+            exclude_paths: Path substrings to suppress (case-insensitive).
+                ``None`` → use :data:`DEFAULT_EXCLUDE_PATHS`.
+                ``[]``   → no path filtering.
+        """
+        excl = _resolve_exclude(exclude_paths)
+        fetch_k = top_k * (_FILTER_OVERFETCH if excl else 2)
+        # Disable filtering inside search(); apply here in a single pass.
+        results = self.search(query, top_k=fetch_k, language=language, exclude_paths=[])
+        filtered = [
+            r
+            for r in results
+            if (chunk_type is None or r.chunk.chunk_type == chunk_type)
+            and (language is None or r.chunk.language == language)
+            and not (excl and _path_matches_any(r.chunk.file_path, excl))
+        ]
+        return filtered[:top_k]
+
     def search_code(
         self,
         query: str,
@@ -118,23 +150,14 @@ class HybridRetriever:
         language: str | None = None,
         exclude_paths: list[str] | None = None,
     ) -> list[SearchResult]:
-        """Search for code chunks with optional path exclusion.
-
-        Calls :meth:`search` with an amplified ``top_k`` so that after
-        discarding excluded paths exactly ``top_k`` code chunks are returned.
-        """
-        excl = _resolve_exclude(exclude_paths)
-        fetch_k = top_k * (_FILTER_OVERFETCH if excl else 2)
-        # Disable filtering inside search(); we apply it here to avoid double-pass
-        results = self.search(query, top_k=fetch_k, language=language, exclude_paths=[])
-        code_results = [
-            r
-            for r in results
-            if r.chunk.chunk_type == "code"
-            and (language is None or r.chunk.language == language)
-            and not (excl and _path_matches_any(r.chunk.file_path, excl))
-        ]
-        return code_results[:top_k]
+        """Search for code chunks. Thin wrapper around :meth:`search_by_type`."""
+        return self.search_by_type(
+            query,
+            chunk_type="code",
+            top_k=top_k,
+            language=language,
+            exclude_paths=exclude_paths,
+        )
 
     def search_docs(
         self,
@@ -142,14 +165,10 @@ class HybridRetriever:
         top_k: int = 10,
         exclude_paths: list[str] | None = None,
     ) -> list[SearchResult]:
-        """Search for documentation chunks with optional path exclusion."""
-        excl = _resolve_exclude(exclude_paths)
-        fetch_k = top_k * (_FILTER_OVERFETCH if excl else 2)
-        results = self.search(query, top_k=fetch_k, exclude_paths=[])
-        doc_results = [
-            r
-            for r in results
-            if r.chunk.chunk_type == "doc"
-            and not (excl and _path_matches_any(r.chunk.file_path, excl))
-        ]
-        return doc_results[:top_k]
+        """Search for documentation chunks. Thin wrapper around :meth:`search_by_type`."""
+        return self.search_by_type(
+            query,
+            chunk_type="doc",
+            top_k=top_k,
+            exclude_paths=exclude_paths,
+        )

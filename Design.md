@@ -77,7 +77,7 @@ code-rag serve                  # 启动 MCP 服务
 │  对外暴露的 Tools:                                    │
 │   • search_code    —— 语义/关键词搜索代码             │
 │   • search_docs    —— 搜索项目文档                    │
-│   • get_file_context —— 获取指定文件及其关联上下文     │
+│   • get_file_symbols —— 获取指定文件的符号映射          │
 │   • get_repo_structure —— 获取仓库结构概览            │
 │   • get_symbol_info —— 查询符号定义/引用              │
 └───────────────────────────┬──────────────────────────┘
@@ -242,7 +242,7 @@ ChromaDB 的关键优势：
 |-----------|---------|---------|-------------|
 | `search_code` | `query: str`, `top_k: int`, `language?: str` | 相关代码块列表（含文件路径、行号、代码内容） | AI 需要查找相关实现 |
 | `search_docs` | `query: str`, `top_k: int` | 相关文档片段列表 | AI 需要了解项目文档 |
-| `get_file_context` | `file_path: str` | 该文件中所有符号的索引信息 | AI 正在编辑某文件，或想了解文件内容 |
+| `get_file_symbols` | `file_path: str` | 该文件中所有符号的索引信息 | AI 正在编辑某文件，或想了解文件内容 |
 | `get_repo_structure` | `depth?: int` | 仓库目录树 + 各目录/文件的简要描述 | AI 需要了解项目整体结构 |
 | `get_symbol_info` | `symbol_name: str` | 符号的定义位置、引用位置、相关代码块 | AI 需要理解某个具体符号 |
 

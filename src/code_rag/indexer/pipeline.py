@@ -228,7 +228,16 @@ class IndexPipeline:
 
         # == Phase 2: Embed in batches with checkpoints ========================
         # Batch by chunk count (not file count) for uniform batch sizes.
-        files_to_embed = [f for f, chunks in all_file_chunks.items() if chunks]
+        # Sort files by average chunk length (ascending) so that short-chunk
+        # files (headers, shaders) fill early batches and benefit from large
+        # batch sizes, while long-chunk files are grouped together at the end.
+        # Total compute is unchanged; this reduces batch-to-batch variance.
+        files_to_embed = sorted(
+            (f for f, chunks in all_file_chunks.items() if chunks),
+            key=lambda f: (
+                sum(len(c.text) for c in all_file_chunks[f]) / len(all_file_chunks[f])
+            ),
+        )
         chunks_created = 0
 
         if files_to_embed:

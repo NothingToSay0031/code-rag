@@ -60,7 +60,7 @@ def _split_identifier(token: str) -> list[str]:
     """Split a code identifier into sub-tokens.
 
     handleAuthCallback → [handleauthcallback, handle, auth, callback]
-    get_file_context  → [get, file, context, get_file_context]
+    get_file_symbols  → [get, file, symbols, get_file_symbols]
     HTTPResponse      → [httpresponse, http, response]
     """
     parts: list[str] = []
