@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -52,6 +53,47 @@ class CodeRagConfig:
         if self.model_name == "BAAI/bge-small-en-v1.5" and device == "cuda":
             return "BAAI/bge-large-en-v1.5"
         return self.model_name
+
+    # ------------------------------------------------------------------
+    # Persistence: save/load model settings to .code-rag/config.json
+    # ------------------------------------------------------------------
+
+    def save(self) -> None:
+        """Persist model_name and device into ``<data_dir>/config.json``.
+
+        Called by :class:`~code_rag.indexer.pipeline.IndexPipeline` after
+        initialisation so the server can recreate the exact same embedder.
+        """
+        config_file = self.abs_data_dir / "config.json"
+        self.abs_data_dir.mkdir(parents=True, exist_ok=True)
+        data = {
+            "model_name": self.model_name,
+            "device": self.device,
+        }
+        config_file.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+    @classmethod
+    def load(cls, repo_path: Path) -> "CodeRagConfig":
+        """Load a :class:`CodeRagConfig` from ``<repo_path>/.code-rag/config.json``.
+
+        Falls back to default values when the file is absent or unreadable
+        (e.g. indices built before this feature was added).
+        """
+        config_file = repo_path / ".code-rag" / "config.json"
+        if config_file.exists():
+            try:
+                data = json.loads(config_file.read_text(encoding="utf-8"))
+                return cls(
+                    repo_path=repo_path,
+                    model_name=data.get("model_name", "Qwen/Qwen3-Embedding-0.6B"),
+                    device=data.get("device", "auto"),
+                )
+            except Exception:
+                pass
+        return cls(repo_path=repo_path)
 
 
 def parse_coderagfilter(path: Path) -> FilterConfig:

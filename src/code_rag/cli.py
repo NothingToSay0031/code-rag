@@ -142,7 +142,7 @@ def _ensure_environment():
                 check=True,
                 timeout=300,
             )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        except subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError:
             pass  # Best effort — don't block the user
 
 
@@ -180,7 +180,23 @@ def main():
     "--exclude", "exclude_patterns", multiple=True, help="Exclude file patterns"
 )
 @click.option("--device", default="auto", help="Device: auto, cpu, or cuda")
-def init(repo_path: str, include_patterns: tuple, exclude_patterns: tuple, device: str):
+@click.option(
+    "--model",
+    "model_name",
+    default=None,
+    help=(
+        "Embedding model to use for this index. "
+        "Defaults to Qwen/Qwen3-Embedding-0.6B. "
+        "Examples: BAAI/bge-large-en-v1.5, Qwen/Qwen3-Embedding-4B"
+    ),
+)
+def init(
+    repo_path: str,
+    include_patterns: tuple,
+    exclude_patterns: tuple,
+    device: str,
+    model_name: str | None,
+):
     """Index a code repository for RAG search.
 
     REPO_PATH: Path to the repository to index.
@@ -188,12 +204,16 @@ def init(repo_path: str, include_patterns: tuple, exclude_patterns: tuple, devic
     from code_rag.config import CodeRagConfig
     from code_rag.indexer.pipeline import IndexPipeline
 
-    config = CodeRagConfig(
+    kwargs: dict = dict(
         repo_path=Path(repo_path),
         device=device,
         include_patterns=[p.replace("\\", "/") for p in include_patterns],
         exclude_patterns=[p.replace("\\", "/") for p in exclude_patterns],
     )
+    if model_name:
+        kwargs["model_name"] = model_name
+
+    config = CodeRagConfig(**kwargs)
 
     click.echo(f"Indexing repository: {repo_path}")
     click.echo(f"Device: {config.resolve_device()}")

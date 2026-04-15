@@ -206,10 +206,13 @@ class Embedder:
         seq_scale = max(1.0, (max(seq_len, 1) / 512) ** 2)
         per_sample_mb = base_per_sample_mb * seq_scale
 
-        # Keep 50% of free VRAM as buffer.  Windows CUDA allocator uses
+        # Keep 40% of free VRAM as buffer.  Windows CUDA allocator uses
         # max_split_size_mb:128 which causes fragmentation over long runs;
-        # the extra headroom prevents late-batch OOM as the allocator drifts.
-        usable_gb = free_gb * 0.50
+        # the extra headroom (was 50%) prevents late-batch OOM as the
+        # allocator drifts.  For very long sequences (4096 tokens) even
+        # the quadratic formula can underestimate real usage, so erring
+        # conservative is cheaper than a crash + checkpoint reload.
+        usable_gb = free_gb * 0.40
         batch_size = max(1, int(usable_gb * 1024 / per_sample_mb))
         return min(batch_size, 128)
 
@@ -295,11 +298,13 @@ class Embedder:
 
                 group_min_len = lengths[sorted_idx[pos]]
 
-                # Refresh VRAM before expensive long-sequence groups.
-                if group_min_len > 1024:
-                    updated = self._get_free_vram_gb()
-                    if updated < free_gb:
-                        free_gb = updated
+                # Aggressively flush the CUDA allocator cache before any
+                # long-sequence group.  After dozens of encode() calls,
+                # fragmentation can silently consume 1–2 GB; a full flush
+                # reclaims that before we commit to a batch size.
+                if group_min_len > 512:
+                    gc.collect()
+                    free_gb = self._get_free_vram_gb()  # calls empty_cache()
 
                 # ----------------------------------------------------------------
                 # Find the optimal batch size via binary search.
@@ -378,6 +383,11 @@ class Embedder:
                     torch.cuda.empty_cache()
                 except ImportError:
                     pass
+                except Exception:
+                    # CUDA context is in a bad state (empty_cache() itself
+                    # failed).  We cannot safely retry — re-raise the original
+                    # OOM so callers see a clean error without chained noise.
+                    raise exc
                 batch_size = max(1, batch_size // 2)
                 print(f"\nGPU OOM – retrying with batch_size={batch_size}")
 

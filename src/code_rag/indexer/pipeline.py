@@ -53,6 +53,10 @@ class IndexPipeline:
         self._bm25_store = BM25Store(self._data_dir / "bm25.pkl")
         self._metadata = MetadataStore(self._data_dir / "metadata.json")
 
+        # Persist model choice so the server can recreate the exact embedder
+        # without relying on CLI args or environment at serve time.
+        config.save()
+
     def run(
         self,
         include_patterns: list[str] | None = None,

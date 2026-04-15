@@ -49,6 +49,7 @@ class _Index:
     prefix: str  # relative path from root to repo (empty for single-index)
     repo_path: Path
     config: CodeRagConfig
+    embedder: Embedder
     metadata: MetadataStore
     hybrid: HybridRetriever
     vector_store: VectorStore
@@ -73,9 +74,11 @@ def _find_sub_indices(root: Path) -> list[Path]:
     return sorted(found)
 
 
-def _build_index(repo_path: Path, prefix: str, embedder: Embedder) -> _Index:
+def _build_index(repo_path: Path, prefix: str) -> _Index:
     data_dir = repo_path / ".code-rag"
-    config = CodeRagConfig(repo_path=repo_path)
+    config = CodeRagConfig.load(repo_path)
+    embedder = Embedder(config.resolve_model_name(), config.resolve_device())
+    embedder._ensure_loaded()
     vector_store = VectorStore(data_dir / "vectors.db", embedder.dimension)
     bm25_store = BM25Store(data_dir / "bm25.pkl")
     metadata = MetadataStore(data_dir / "metadata.json")
@@ -99,6 +102,7 @@ def _build_index(repo_path: Path, prefix: str, embedder: Embedder) -> _Index:
         prefix=prefix,
         repo_path=repo_path,
         config=config,
+        embedder=embedder,
         metadata=metadata,
         hybrid=hybrid,
         vector_store=vector_store,
@@ -114,20 +118,16 @@ def _get_state() -> dict:
     root = Path(os.environ.get("CODE_RAG_REPO", ".")).resolve()
     data_dir = root / ".code-rag"
 
-    # Shared embedder (one model instance for all indices)
-    config_for_model = CodeRagConfig(repo_path=root)
-    embedder = Embedder(
-        config_for_model.resolve_model_name(), config_for_model.resolve_device()
-    )
-    # Eagerly load the model so the first MCP request doesn't time out
-    embedder._ensure_loaded()
-
     indices: list[_Index] = []
 
     if data_dir.exists():
         # Single-index: CWD itself is an indexed repo
-        indices.append(_build_index(root, prefix="", embedder=embedder))
-        print(f"[CodeRAG] Single index: {root}", file=sys.stderr)
+        indices.append(_build_index(root, prefix=""))
+        idx = indices[0]
+        print(
+            f"[CodeRAG] Single index: {root}  model={idx.config.resolve_model_name()}",
+            file=sys.stderr,
+        )
     else:
         # Multi-index: scan subdirectories
         sub_repos = _find_sub_indices(root)
@@ -141,15 +141,14 @@ def _get_state() -> dict:
                 prefix = repo_path.relative_to(root).as_posix()
             except ValueError:
                 prefix = repo_path.name
-            indices.append(_build_index(repo_path, prefix=prefix, embedder=embedder))
-        names = [idx.prefix for idx in indices]
-        print(f"[CodeRAG] Multi-index ({len(indices)} repos): {names}", file=sys.stderr)
+            indices.append(_build_index(repo_path, prefix=prefix))
+        info = [f"{idx.prefix}({idx.config.resolve_model_name()})" for idx in indices]
+        print(f"[CodeRAG] Multi-index ({len(indices)} repos): {info}", file=sys.stderr)
 
     _state.update(
         {
             "root": root,
             "indices": indices,
-            "embedder": embedder,
         }
     )
     return _state
@@ -329,7 +328,9 @@ def list_indices() -> str:
     state = _get_state()
     indices = state["indices"]
     return "\n".join(
-        f"{idx.prefix or '(root)'}  {idx.repo_path}  ({idx.metadata.count_files()} files)"
+        f"{idx.prefix or '(root)'}  {idx.repo_path}  "
+        f"model={idx.config.resolve_model_name()}  "
+        f"({idx.metadata.count_files()} files)"
         for idx in indices
     )
 
