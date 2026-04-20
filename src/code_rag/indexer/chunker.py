@@ -208,6 +208,12 @@ def _chunk_ast_node(
     # If it fits, return as single chunk
     doc = f"# {node.doc_comment}\n" if node.doc_comment else ""
     if count_tokens(doc + full_text) <= max_tokens:
+        # Count extra lines prepended before the actual file content so that
+        # _build_snippet can map code_lines[i] → file line (start_line + i)
+        # correctly.  chunk.text = doc + context_prefix + node_text, so the
+        # file content starts at line index (doc + context_prefix).count("\n").
+        header_lines = (doc + context_prefix).count("\n")
+        metadata: dict = {"header_lines": header_lines} if header_lines else {}
         return [
             Chunk(
                 text=doc + full_text,
@@ -218,7 +224,7 @@ def _chunk_ast_node(
                 language=language,
                 symbol_name=symbol_name,
                 symbol_kind=symbol_kind,
-                metadata={},
+                metadata=metadata,
             )
         ]
 

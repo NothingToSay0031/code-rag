@@ -19,7 +19,7 @@ _CONFIG_FILE = Path.home() / ".config" / "code-rag" / "config.json"
 
 _MCP_CLIENTS = {
     "opencode": {
-        "files": ["opencode.json"],
+        "files": [".opencode/opencode.json"],
         "schema": "https://opencode.ai/config.json",
     },
 }
@@ -83,7 +83,8 @@ def _write_project_mcp_configs(
             target = repo_path / rel_file
             # Build the update payload matching each client's schema
             if client == "opencode":
-                update = {"mcp": {"code-rag": mcp_entry}}
+                mcp_entry_with_timeout = {**mcp_entry, "timeout": 180000}
+                update = {"mcp": {"code-rag": mcp_entry_with_timeout}}
                 if "schema" in info:
                     update["$schema"] = info["schema"]  # type: ignore[assignment]
             else:

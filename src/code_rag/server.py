@@ -397,12 +397,20 @@ def _build_snippet(
     """
     snippet_full_limit, snippet_sym_lines = _adaptive_snippet_limits(top_k, rank)
     code_lines = (r.chunk.text or "").splitlines()
-    total_lines = len(code_lines)
+
+    # chunk.text = doc_comment_prefix + context_prefix + node_source_text.
+    # The first header_lines lines are NOT real file lines at start_line; they
+    # are prepended metadata.  Skip them so line-number labels are accurate.
+    header_lines = r.chunk.metadata.get("header_lines", 0)
+    content_lines = code_lines[
+        header_lines:
+    ]  # Actual file lines starting at start_line
+    total_lines = len(content_lines)
 
     # Fast path: chunk fits within the adaptive limit — show everything.
     if total_lines <= snippet_full_limit:
         return "\n".join(
-            f"{r.chunk.start_line + i}: {line}" for i, line in enumerate(code_lines)
+            f"{r.chunk.start_line + i}: {line}" for i, line in enumerate(content_lines)
         )
 
     if r.chunk.chunk_type == "code":
@@ -418,7 +426,7 @@ def _build_snippet(
         )
         if not chunk_syms:
             # No symbol metadata: first 30 lines + hint.
-            visible = code_lines[:30]
+            visible = content_lines[:30]
             snippet = "\n".join(
                 f"{r.chunk.start_line + i}: {line}" for i, line in enumerate(visible)
             )
@@ -434,8 +442,10 @@ def _build_snippet(
             f" call read_code for full content)"
         ]
         for sym in chunk_syms:
-            rel = sym.start_line - r.chunk.start_line
-            if 0 <= rel < total_lines:
+            # header_lines shifts all content: code_lines[header_lines + k]
+            # corresponds to file line (start_line + k).
+            rel = sym.start_line - r.chunk.start_line + header_lines
+            if 0 <= rel < len(code_lines):
                 sym_len = min(
                     snippet_sym_lines,
                     sym.end_line - sym.start_line + 1,
@@ -454,7 +464,7 @@ def _build_snippet(
         return "\n\n".join(sym_parts)
     else:
         # Large doc chunk: first snippet_full_limit lines + truncation hint.
-        visible = code_lines[:snippet_full_limit]
+        visible = content_lines[:snippet_full_limit]
         snippet = "\n".join(
             f"{r.chunk.start_line + i}: {line}" for i, line in enumerate(visible)
         )
