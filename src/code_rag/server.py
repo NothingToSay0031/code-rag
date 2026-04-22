@@ -255,8 +255,7 @@ def _resolve_index(indices: list[_Index], index_name: str | None) -> _Index:
     if index_name is None:
         names = [idx.prefix for idx in indices]
         raise ValueError(
-            f"Multiple indices available ({names}). "
-            "Call list_indices() first, then pass index_name."
+            f"Multiple indices available. Re-call with index_name set to one of: {names}."
         )
     for idx in indices:
         if idx.prefix == index_name:
