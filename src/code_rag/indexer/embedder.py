@@ -149,14 +149,23 @@ class Embedder:
         self._backend = "sentence_transformers"
         print(f"Model loaded (torch). Dimension: {self.dimension}")
 
-    def _get_free_vram_gb(self) -> float:
-        """Return current free VRAM in GB.  Returns 0.0 on non-CUDA or error."""
+    def _get_free_vram_gb(self, flush_cache: bool = True) -> float:
+        """Return current free VRAM in GB.  Returns 0.0 on non-CUDA or error.
+
+        Args:
+            flush_cache: If *True* (default), call ``torch.cuda.empty_cache()``
+                before querying so the result reflects reclaimable memory.  Set
+                to *False* to see the *operational* free VRAM (i.e. without
+                flushing the caching allocator), which reveals how much memory
+                pressure the allocator is under mid-run.
+        """
         if self._resolved_device != "cuda":
             return 0.0
         try:
             import torch
 
-            torch.cuda.empty_cache()
+            if flush_cache:
+                torch.cuda.empty_cache()
             free_bytes, _ = torch.cuda.mem_get_info(0)
             return free_bytes / 1e9
         except Exception:
@@ -271,6 +280,7 @@ class Embedder:
         # Re-using this avoids a CUDA context sync per mini-batch.
         # It is refreshed after any OOM event inside _encode_with_retry.
         free_gb = self._get_free_vram_gb()
+        free_gb_no_flush = self._get_free_vram_gb(flush_cache=False)
 
         min_len = lengths[sorted_idx[0]]
         max_len = lengths[sorted_idx[-1]]
@@ -279,7 +289,7 @@ class Embedder:
         print(
             f"  Token lengths: min={min_len}, max={max_len} | "
             f"batch_size: {bs_long} (long) → {bs_short} (short) | "
-            f"free VRAM: {free_gb:.1f} GB"
+            f"free VRAM: {free_gb_no_flush:.1f} GB (after flush: {free_gb:.1f} GB)"
         )
 
         all_embeddings: list[np.ndarray | None] = [None] * len(texts)
@@ -294,7 +304,13 @@ class Embedder:
                 # to prevent cumulative drift from hundreds of encode() calls.
                 if groups_done % 50 == 0:
                     gc.collect()
+                    free_gb_no_flush = self._get_free_vram_gb(flush_cache=False)
                     free_gb = self._get_free_vram_gb()
+                    pbar.write(
+                        f"  [VRAM refresh @ group {groups_done}] "
+                        f"free: {free_gb_no_flush:.1f} GB "
+                        f"(after flush: {free_gb:.1f} GB)"
+                    )
 
                 group_min_len = lengths[sorted_idx[pos]]
 
@@ -343,6 +359,9 @@ class Embedder:
                     # Hard failure: refresh VRAM so subsequent groups are
                     # sized more conservatively before re-raising.
                     free_gb = self._get_free_vram_gb()
+                    pbar.write(
+                        f"  [VRAM after OOM failure] free: {free_gb:.1f} GB"
+                    )
                     raise
 
                 for k, orig_idx in enumerate(group_orig_idx):

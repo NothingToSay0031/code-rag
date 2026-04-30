@@ -243,8 +243,7 @@ def discover_files(repo_path: Path, config: CodeRagConfig) -> list[Path]:
             # Use forward-slash relative string for pathspec matching
             rel_str = rel.as_posix()
 
-            # CLI --include is the highest-priority override: if specified and matches,
-            # the file is included regardless of .gitignore/.coderagfilter excludes.
+            # CLI --include overrides .gitignore/.coderagfilter (but not --exclude).
             force_included = cli_include_spec and cli_include_spec.match_file(rel_str)
 
             if not force_included:

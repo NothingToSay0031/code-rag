@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import ast
 import importlib
+import re
+import warnings
 from dataclasses import dataclass, field
 
 from tree_sitter import Language, Parser, Tree
@@ -311,11 +313,19 @@ def _should_include_symbol(node, kind: str) -> bool:
     return True
 
 
+_INVALID_ESCAPE_RE = re.compile(r"\\(?![\\'\"abfnrtv0-7xNuU])")
+
+
 def _normalize_python_docstring(text: str) -> str:
     stripped = text.strip()
+    # Escape invalid backslash sequences (e.g. \*) so ast.literal_eval
+    # can parse the string literal without SyntaxError / SyntaxWarning.
+    sanitized = _INVALID_ESCAPE_RE.sub(r"\\\\", stripped)
     try:
-        value = ast.literal_eval(stripped)
-    except SyntaxError, ValueError:
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=SyntaxWarning)
+            value = ast.literal_eval(sanitized)
+    except (SyntaxError, ValueError):
         return stripped
     return value if isinstance(value, str) else stripped
 
