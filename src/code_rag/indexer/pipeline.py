@@ -295,21 +295,67 @@ class IndexPipeline:
                         [chunk.text for chunk in batch_chunks]
                     )
                 except Exception as exc:
-                    # CUDA errors (OOM, driver crash) — save what we have and
-                    # re-raise so the process can be restarted to resume.
-                    print(
-                        f"\n!!! Embedding failed at batch {batch_num}: "
-                        f"{type(exc).__name__}: {exc}"
-                    )
-                    print("Saving checkpoint before exit...")
-                    self._bm25_store.save()
-                    self._metadata.save()
-                    print(
-                        f"Checkpoint saved. "
-                        f"{chunks_created} chunks embedded so far. "
-                        f"Re-run to resume from batch {batch_num}."
-                    )
-                    raise
+                    # On transient CUDA errors (e.g. cudaErrorUnknown,
+                    # AcceleratorError) the embed_passages retry logic may
+                    # have already exhausted its per-group retries.  Before
+                    # giving up on the entire batch, try one more time with
+                    # a full GPU reset — these errors are often transient
+                    # (WDDM TDR, driver hiccup) and a fresh attempt succeeds.
+                    from code_rag.indexer.embedder import Embedder
+
+                    if Embedder._is_cuda_error(exc):
+                        print(
+                            f"\n!!! CUDA error at batch {batch_num}: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                        print("Attempting GPU reset + retry for entire batch...")
+                        gc.collect()
+                        try:
+                            import torch
+
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                                try:
+                                    torch.cuda.synchronize()
+                                except RuntimeError:
+                                    pass
+                        except ImportError:
+                            pass
+                        try:
+                            embeddings = self._embedder.embed_passages(
+                                [chunk.text for chunk in batch_chunks]
+                            )
+                        except Exception as retry_exc:
+                            # Retry also failed — checkpoint and exit.
+                            print(
+                                f"\n!!! Retry also failed: "
+                                f"{type(retry_exc).__name__}: {retry_exc}"
+                            )
+                            print("Saving checkpoint before exit...")
+                            self._bm25_store.save()
+                            self._metadata.save()
+                            print(
+                                f"Checkpoint saved. "
+                                f"{chunks_created} chunks embedded so far. "
+                                f"Re-run to resume from batch {batch_num}."
+                            )
+                            raise
+                    else:
+                        # Non-CUDA error (e.g. logic bug) — checkpoint and
+                        # re-raise immediately; retrying won't help.
+                        print(
+                            f"\n!!! Embedding failed at batch {batch_num}: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                        print("Saving checkpoint before exit...")
+                        self._bm25_store.save()
+                        self._metadata.save()
+                        print(
+                            f"Checkpoint saved. "
+                            f"{chunks_created} chunks embedded so far. "
+                            f"Re-run to resume from batch {batch_num}."
+                        )
+                        raise
 
                 chunk_ids = self._vector_store.insert(batch_chunks, embeddings)
                 chunks_created += len(chunk_ids)
