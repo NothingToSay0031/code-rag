@@ -16,6 +16,14 @@ if sys.platform == "linux":
 elif sys.platform == "win32":
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
 
+# Set CODE_RAG_CUDA_LAUNCH_BLOCKING=1 to force synchronous CUDA execution.
+# This makes CUDA errors report at the exact kernel that caused them instead
+# of surfacing asynchronously at a later API call.  Useful for debugging
+# cudaErrorUnknown / driver crashes.  Left off by default because it slows
+# down GPU inference significantly.
+if os.environ.get("CODE_RAG_CUDA_LAUNCH_BLOCKING", "").strip() in ("1", "true"):
+    os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "1")
+
 MODEL_CONFIGS = {
     "BAAI/bge-small-en-v1.5": 384,
     "BAAI/bge-large-en-v1.5": 1024,
@@ -374,14 +382,67 @@ class Embedder:
 
         return np.vstack(all_embeddings)  # type: ignore[arg-type]
 
+    @staticmethod
+    def _is_cuda_error(exc: BaseException) -> bool:
+        """Return True if *exc* looks like a CUDA-level failure.
+
+        Covers:
+        - ``RuntimeError`` with "out of memory" or "CUDA error"
+        - ``AcceleratorError`` (from HuggingFace accelerate)
+        - Any exception whose *args* mention "CUDA" or "cuda"
+        """
+        msg = str(exc).lower()
+        if "out of memory" in msg or "cuda error" in msg:
+            return True
+        # AcceleratorError is raised by sentence-transformers / accelerate
+        # for CUDA-level failures (e.g. cudaErrorUnknown, driver crash).
+        type_name = type(exc).__name__.lower()
+        if "accelerator" in type_name or "cuda" in type_name:
+            return True
+        return False
+
+    def _reset_cuda(self) -> None:
+        """Best-effort CUDA context reset after a transient error.
+
+        Calls ``gc.collect()`` + ``torch.cuda.empty_cache()``.  If the
+        CUDA context is so badly corrupted that even ``empty_cache()`` fails,
+        the exception is swallowed — callers should still re-raise the
+        *original* error.
+        """
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                # Synchronise to surface any latent async errors.  If this
+                # itself fails the context is unrecoverable, but we swallow
+                # so the caller can decide what to do.
+                try:
+                    torch.cuda.synchronize()
+                except RuntimeError:
+                    pass
+        except ImportError:
+            pass
+        except Exception:
+            pass
+
     def _encode_with_retry(self, texts: list[str]) -> np.ndarray:
-        """Encode a length-homogeneous group with OOM halving retry.
+        """Encode a length-homogeneous group with OOM halving + CUDA retry.
 
         Unlike the previous implementation which restarted the entire
         5 000-chunk list after OOM, here we only retry the small group,
         so recovery is cheap and fast.
+
+        Handles two classes of error:
+        1. **OOM** – halve batch size and retry (existing behaviour).
+        2. **Transient CUDA errors** (e.g. ``cudaErrorUnknown``,
+           ``AcceleratorError``) – reset the CUDA context and retry up
+           to ``_cuda_retries`` times with the same batch size before
+           giving up.
         """
         batch_size = len(texts)
+        cuda_retries_left = 3  # retries for non-OOM CUDA errors
         while True:
             try:
                 return self._model.encode(  # type: ignore[union-attr]
@@ -392,23 +453,32 @@ class Embedder:
                 )
             except RuntimeError as exc:
                 oom = "out of memory" in str(exc).lower()
-                if not oom or batch_size <= 1:
-                    raise
-                # Release any tensors left behind by the failed encode.
-                gc.collect()
-                try:
-                    import torch
-
-                    torch.cuda.empty_cache()
-                except ImportError:
-                    pass
-                except Exception:
-                    # CUDA context is in a bad state (empty_cache() itself
-                    # failed).  We cannot safely retry — re-raise the original
-                    # OOM so callers see a clean error without chained noise.
-                    raise exc
-                batch_size = max(1, batch_size // 2)
-                print(f"\nGPU OOM – retrying with batch_size={batch_size}")
+                if oom and batch_size > 1:
+                    # OOM path: halve the batch size.
+                    self._reset_cuda()
+                    batch_size = max(1, batch_size // 2)
+                    print(f"\nGPU OOM – retrying with batch_size={batch_size}")
+                    continue
+                if self._is_cuda_error(exc) and cuda_retries_left > 0:
+                    cuda_retries_left -= 1
+                    print(
+                        f"\nCUDA error (RuntimeError): {exc} – "
+                        f"resetting GPU, {cuda_retries_left} retries left"
+                    )
+                    self._reset_cuda()
+                    continue
+                raise
+            except Exception as exc:
+                # Catch AcceleratorError and other non-RuntimeError CUDA errors.
+                if self._is_cuda_error(exc) and cuda_retries_left > 0:
+                    cuda_retries_left -= 1
+                    print(
+                        f"\nCUDA error ({type(exc).__name__}): {exc} – "
+                        f"resetting GPU, {cuda_retries_left} retries left"
+                    )
+                    self._reset_cuda()
+                    continue
+                raise
 
     def embed_query(self, query: str) -> np.ndarray:
         """Embed a query with the appropriate instruction prefix for the model."""
