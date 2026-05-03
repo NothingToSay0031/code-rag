@@ -256,19 +256,16 @@ def discover_files(repo_path: Path, config: CodeRagConfig) -> list[Path]:
                     ):
                         continue
 
-                # (d) .coderagfilter excludes
+                # (d) .coderagfilter excludes — always respected; include
+                #     only overrides *external* ignores (.gitignore), not
+                #     excludes from the same .coderagfilter file.
                 if coderag_exclude_spec and coderag_exclude_spec.match_file(rel_str):
-                    # Check .coderagfilter include (! rules override exclude rules)
-                    if not (
-                        coderag_include_spec
-                        and coderag_include_spec.match_file(rel_str)
-                    ):
-                        continue
+                    continue
 
             # (e) CLI --include: if specified, file must match
             if cli_include_spec and not cli_include_spec.match_file(rel_str):
                 continue
-            # CLI --exclude: always respected
+            # CLI --exclude: highest priority — always respected, overrides --include
             if cli_exclude_spec and cli_exclude_spec.match_file(rel_str):
                 continue
 
