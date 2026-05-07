@@ -1155,9 +1155,45 @@ def _find_references(idx: _Index, symbol: SymbolInfo, max_refs: int = 30) -> lis
         exclude_file=symbol.file_path,
         exclude_lines=(symbol.start_line, symbol.end_line),
     )
-    # Qualify paths with index prefix.
+    # Keep only source-code references by default.
+    code_exts = set(_EXT_LANGUAGE_MAP.keys())
+    code_refs: list[dict] = []
     for ref in refs:
+        file_path = ref.get("file_path")
+        if not file_path:
+            continue
+        if Path(file_path).suffix.lower() in code_exts:
+            code_refs.append(ref)
+
+    # Deduplicate by file/line/text to reduce noisy repeats.
+    deduped: list[dict] = []
+    seen: set[tuple[str, int, str]] = set()
+    for ref in code_refs:
+        file_path = str(ref.get("file_path", ""))
+        line_no = int(ref.get("start_line", 0))
+        text = str(ref.get("text", "")).strip()
+        key = (file_path, line_no, text)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(ref)
+
+    # Prioritize references in the same language as the symbol.
+    sym_lang = (symbol.language or "").lower()
+
+    def _sort_key(ref: dict) -> tuple[int, str, int]:
+        rel_path = str(ref.get("file_path", ""))
+        ref_lang = _guess_language(rel_path).lower()
+        same_lang_rank = 0 if sym_lang and ref_lang == sym_lang else 1
+        line_no = int(ref.get("start_line", 0))
+        return (same_lang_rank, rel_path, line_no)
+
+    deduped.sort(key=_sort_key)
+    limited = deduped[:max_refs]
+
+    # Qualify paths with index prefix.
+    for ref in limited:
         file_path = ref.get("file_path")
         if file_path:
             ref["file_path"] = _qualify_path(idx.prefix, file_path)
-    return refs
+    return limited
