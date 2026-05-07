@@ -338,10 +338,16 @@ def _render_refs(refs: list[dict]) -> str:
     """Render a reference list as indented plain text."""
     if not refs:
         return "  (no references found)"
-    return "\n".join(
-        f"  {r['file_path']}  L{r['line']}  {r.get('context', '').strip()}"
-        for r in refs
-    )
+    rendered: list[str] = []
+    for r in refs:
+        file_path = r.get("file_path", "(unknown)")
+        start_line = r.get("start_line", "?")
+        end_line = r.get("end_line", start_line)
+        line_label = (
+            f"L{start_line}–{end_line}" if start_line != end_line else f"L{start_line}"
+        )
+        rendered.append(f"  {file_path}  {line_label}  {str(r.get('text', '')).strip()}")
+    return "\n".join(rendered)
 
 
 def _render_results(
@@ -1149,7 +1155,9 @@ def _find_references(idx: _Index, symbol: SymbolInfo, max_refs: int = 30) -> lis
         exclude_file=symbol.file_path,
         exclude_lines=(symbol.start_line, symbol.end_line),
     )
-    # Qualify paths with index prefix
+    # Qualify paths with index prefix.
     for ref in refs:
-        ref["file_path"] = _qualify_path(idx.prefix, ref["file_path"])
+        file_path = ref.get("file_path")
+        if file_path:
+            ref["file_path"] = _qualify_path(idx.prefix, file_path)
     return refs
