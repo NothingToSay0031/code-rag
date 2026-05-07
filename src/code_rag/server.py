@@ -741,7 +741,7 @@ def _adaptive_snippet_limits(top_k: int, rank: int) -> tuple[int, int]:
 
 
 # Separator line used by _render_code_results.
-_SEP = "─" * 60
+_SEP = "---"
 
 # Maximum children to list per directory before summarising
 _MAX_DIR_CHILDREN = 30
