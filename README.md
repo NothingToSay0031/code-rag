@@ -120,13 +120,13 @@ Use the project virtual environment on Windows:
 
 ```powershell
 # MCP smoke suite
-.\.venv\Scripts\python -m pytest -q tests\mcp_smoke\test_mcp_smoke.py
+.\.venv\Scripts\python.exe -m pytest -q tests\mcp_smoke\test_mcp_smoke.py
 
 # Unit tests
-.\.venv\Scripts\python -m pytest -q tests
+.\.venv\Scripts\python.exe -m pytest -q tests
 
 # Force rebuild index during smoke run
-$env:MCP_SMOKE_FORCE_REINDEX='1'; .\.venv\Scripts\python -m pytest -q tests\mcp_smoke\test_mcp_smoke.py
+$env:MCP_SMOKE_FORCE_REINDEX='1'; .\.venv\Scripts\python.exe -m pytest -q tests\mcp_smoke\test_mcp_smoke.py
 ```
 
 Smoke artifacts are written to `tests\artifacts\mcp-smoke\` by default.
