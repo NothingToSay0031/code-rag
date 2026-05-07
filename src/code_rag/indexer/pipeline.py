@@ -3,7 +3,7 @@ from __future__ import annotations
 import gc
 import time
 from dataclasses import dataclass, replace
-from pathlib import Path
+from pathlib import Path, PurePath
 
 from tqdm import tqdm
 
@@ -31,6 +31,11 @@ class IndexStats:
     files_skipped: int
     files_deleted: int
     elapsed_seconds: float
+
+
+def _relative_path_key(path: PurePath) -> str:
+    """Return the canonical relative path key used by metadata and stores."""
+    return path.as_posix()
 
 
 class IndexPipeline:
@@ -95,7 +100,9 @@ class IndexPipeline:
         current_fingerprints: dict[str, str] = {}
         for file_path in tqdm(files, desc="Fingerprinting", unit="file"):
             abs_path = config.repo_path / file_path
-            current_fingerprints[str(file_path)] = get_file_fingerprint(abs_path)
+            current_fingerprints[_relative_path_key(file_path)] = get_file_fingerprint(
+                abs_path
+            )
 
         new_files, modified_files, deleted_files = self._metadata.get_changed_files(
             current_fingerprints
