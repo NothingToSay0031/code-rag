@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import click
@@ -143,8 +144,53 @@ def _ensure_environment():
                 check=True,
                 timeout=300,
             )
-        except subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError:
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            OSError,
+        ):
             pass  # Best effort — don't block the user
+
+
+def _code_rag_git_root() -> Path | None:
+    """Locate the git checkout root for this installation, if it exists.
+
+    Walks upward from this package so editable installs and ``src/`` layouts
+    resolve to the repository root; plain wheel installs under site-packages
+    typically have no matching checkout.
+    """
+    here = Path(__file__).resolve().parent
+    for d in [here, *here.parents]:
+        git = d / ".git"
+        pyproject = d / "pyproject.toml"
+        if not git.exists() or not pyproject.is_file():
+            continue
+        try:
+            data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        name = (data.get("project") or {}).get("name")
+        if name == "code-rag":
+            return d
+    return None
+
+
+def _git_pull_code_rag_repo() -> None:
+    root = _code_rag_git_root()
+    if root is None:
+        raise click.ClickException(
+            "Cannot find a git checkout for code-rag "
+            "(need a clone with .git and pyproject.toml name code-rag)."
+        )
+    click.echo(f"Updating code-rag at {root} (git pull)...", err=True)
+    try:
+        subprocess.run(["git", "pull"], cwd=str(root), check=True)
+    except FileNotFoundError as exc:
+        raise click.ClickException(
+            "git was not found in PATH; install Git or use git pull manually."
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        raise click.ClickException(f"git pull failed (exit {exc.returncode}).") from exc
 
 
 def _save_last_repo(repo_path: str):
@@ -162,11 +208,22 @@ def _load_last_repo() -> str | None:
     return None
 
 
-@click.group()
+@click.group(invoke_without_command=True)
 @click.version_option(version="0.1.0")
-def main():
+@click.option(
+    "--update",
+    is_flag=True,
+    help="Run git pull in the code-rag source repository (git clone / installer checkout).",
+)
+@click.pass_context
+def main(ctx: click.Context, update: bool) -> None:
     """code-rag: Local code repository RAG with MCP server."""
+    if update:
+        _git_pull_code_rag_repo()
+        ctx.exit(0)
     _ensure_environment()
+    if ctx.invoked_subcommand is None:
+        click.echo(ctx.get_help())
 
 
 @main.command()

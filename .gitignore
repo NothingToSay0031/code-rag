@@ -1,8 +1,16 @@
-test*/
+# Python cache / bytecode
+__pycache__/
 *.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.ruff_cache/
+
+# Logs
 *.log
-*cache/
-.sisyphus/
+
+# Local environments / tooling state
 .venv/
-nul
-run_index.py
+
+# Generated test artifacts
+tests/artifacts/
