@@ -52,11 +52,22 @@ Each file points the MCP at the specific repo path, so the tools are only active
 ## CLI reference
 
 ```
+code-rag --update                  Git-pull the code-rag installation (see below)
 code-rag init <REPO_PATH>          Index a repository (creates .code-rag/ + MCP configs)
 code-rag serve [--repo <path>]     Start the MCP server manually
 code-rag setup-mcp [--global]      Write MCP config without re-indexing
                                    --global  -> write to AI client's global config
 ```
+
+### Updating code-rag itself
+
+If you installed with the one-click script (a git clone under e.g. `~/.code-rag` on Unix or `%USERPROFILE%\.code-rag` on Windows), you can pull the latest `code-rag` source and then rely on your existing venv or re-run the installer as needed:
+
+```bash
+code-rag --update
+```
+
+This runs `git pull` in the detected code-rag repository root (a checkout that contains both `.git` and this project’s `pyproject.toml` with `name = "code-rag"`). It does **not** update your indexed projects — for those, re-run `code-rag init` on the project path (see [Keeping the index up to date](#keeping-the-index-up-to-date)). Plain PyPI / wheel-only installs with no git checkout will report that no repository was found.
 
 ### Options for `init`
 
