@@ -55,6 +55,9 @@ class _Index:
     vector_store: VectorStore
     bm25_store: BM25Store
     browse_db: BrowseDBProvider | None = None
+    # Lazy lower→actual case map of indexed file paths.  Used to normalise
+    # Browse.VC.db results, which are stored in all-uppercase by MSVC.
+    _path_case_map: dict[str, str] | None = field(default=None, repr=False)
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +194,41 @@ def _guess_language(file_path: str) -> str:
     """Guess language from file extension (used for Browse.VC.db results)."""
     ext = Path(file_path).suffix.lower()
     return _EXT_LANGUAGE_MAP.get(ext, "")
+
+
+def _normalize_cpp_path(idx: "_Index", abs_path_str: str) -> str:
+    """Convert a Browse.VC.db absolute path to a repo-relative path with the
+    real on-disk case.
+
+    Browse.VC.db stores paths in upper-case; the real filesystem case lives
+    in :attr:`_Index.metadata`.  We do a case-insensitive prefix strip first,
+    then look up the actual case.  Falls back gracefully if the file is not
+    indexed.
+    """
+    if not abs_path_str:
+        return abs_path_str
+    p = abs_path_str.replace("\\", "/")
+    repo = str(idx.repo_path).replace("\\", "/").rstrip("/")
+    p_lower = p.lower()
+    repo_lower = repo.lower()
+
+    if p_lower == repo_lower:
+        rel = ""
+    elif p_lower.startswith(repo_lower + "/"):
+        rel = p[len(repo) + 1 :]
+    else:
+        # Not under repo root — try Path.relative_to as a last resort.
+        try:
+            rel = Path(abs_path_str).relative_to(idx.repo_path).as_posix()
+        except ValueError:
+            return p  # leave as-is
+
+    if not rel:
+        return rel
+
+    if idx._path_case_map is None:
+        idx._path_case_map = {f.lower(): f for f in idx.metadata.get_all_files()}
+    return idx._path_case_map.get(rel.lower(), rel)
 
 
 def _resolve_file(
@@ -335,9 +373,13 @@ def list_indices() -> str:
 
 
 def _render_refs(refs: list[dict]) -> str:
-    """Render a reference list as indented plain text."""
+    """Render a reference list as indented plain text.
+
+    Returns an empty string when there are no references so callers can omit
+    the entire ``References`` section instead of printing a placeholder.
+    """
     if not refs:
-        return "  (no references found)"
+        return ""
     rendered: list[str] = []
     for r in refs:
         file_path = r.get("file_path", "(unknown)")
@@ -868,12 +910,9 @@ def get_symbol_info(
             db_results = idx.browse_db.find_symbol(symbol_name)
             if db_results:
                 for item in db_results:
-                    # Convert absolute path to relative
-                    abs_file = Path(item["file_path"])
-                    try:
-                        rel_path = abs_file.relative_to(idx.repo_path).as_posix()
-                    except ValueError:
-                        rel_path = item["file_path"]
+                    # Convert absolute path to relative AND restore actual
+                    # filesystem case (Browse.VC.db stores upper-cased paths).
+                    rel_path = _normalize_cpp_path(idx, item["file_path"])
                     raw_symbols.append(
                         (
                             idx,
@@ -1007,8 +1046,9 @@ def _symbol_info_all(
                 lines.append(code)
         if include_references:
             refs = _find_references(idx, s, max_refs=max_refs_per_symbol)
-            lines.append(f"\nReferences ({len(refs)}):")
-            lines.append(_render_refs(refs))
+            if refs:
+                lines.append(f"\nReferences ({len(refs)}):")
+                lines.append(_render_refs(refs))
         count += 1
     lines.append(_SEP)
     return "\n".join(lines) if lines else "(no results)"
@@ -1042,8 +1082,9 @@ def _symbol_info_declaration(
                 lines.append(code)
         if include_references:
             refs = _find_references(idx, s, max_refs=max_refs_per_symbol)
-            lines.append(f"\nReferences ({len(refs)}):")
-            lines.append(_render_refs(refs))
+            if refs:
+                lines.append(f"\nReferences ({len(refs)}):")
+                lines.append(_render_refs(refs))
         count += 1
     lines.append(_SEP)
     return "\n".join(lines) if lines else "(no results)"
@@ -1129,8 +1170,9 @@ def _symbol_info_grouped(
                 refs = _find_references(
                     idx, range_syms[0], max_refs=max_refs_per_symbol
                 )
-                out_lines.append(f"\nReferences ({len(refs)}):")
-                out_lines.append(_render_refs(refs))
+                if refs:
+                    out_lines.append(f"\nReferences ({len(refs)}):")
+                    out_lines.append(_render_refs(refs))
 
             result_count += 1
 
