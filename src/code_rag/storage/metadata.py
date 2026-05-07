@@ -4,6 +4,10 @@ from pathlib import Path
 from code_rag.models import FileInfo, SymbolInfo
 
 
+def _normalize_path(file_path: str) -> str:
+    return file_path.replace("\\", "/")
+
+
 class MetadataStore:
     def __init__(self, store_path: Path):
         self._store_path = store_path
@@ -16,16 +20,19 @@ class MetadataStore:
             self._load()
 
     def set_file_info(self, file_path: str, info: FileInfo):
+        file_path = _normalize_path(file_path)
+        info.path = _normalize_path(info.path)
         self._files[file_path] = info
 
     def get_file_info(self, file_path: str) -> FileInfo | None:
-        return self._files.get(file_path)
+        return self._files.get(_normalize_path(file_path))
 
     def get_fingerprint(self, file_path: str) -> str | None:
-        info = self._files.get(file_path)
+        info = self._files.get(_normalize_path(file_path))
         return info.sha256 if info else None
 
     def set_symbols(self, file_path: str, symbols: list[SymbolInfo]):
+        file_path = _normalize_path(file_path)
         # Remove old entries from name index
         old = self._symbols.get(file_path, [])
         for sym in old:
@@ -39,13 +46,15 @@ class MetadataStore:
                 if not bucket:
                     del self._name_index[key]
         # Store new symbols
+        for sym in symbols:
+            sym.file_path = _normalize_path(sym.file_path) if sym.file_path else file_path
         self._symbols[file_path] = symbols
         # Add to name index
         for sym in symbols:
             self._name_index.setdefault(sym.name.lower(), []).append(sym)
 
     def get_symbols(self, file_path: str) -> list[SymbolInfo]:
-        return self._symbols.get(file_path, [])
+        return self._symbols.get(_normalize_path(file_path), [])
 
     def find_symbol(
         self, symbol_name: str, *, limit: int = 200, exact_only: bool = False
@@ -85,12 +94,13 @@ class MetadataStore:
         return exact + partial
 
     def set_chunk_ids(self, file_path: str, chunk_ids: list[int]):
-        self._chunk_map[file_path] = chunk_ids
+        self._chunk_map[_normalize_path(file_path)] = chunk_ids
 
     def get_chunk_ids(self, file_path: str) -> list[int]:
-        return self._chunk_map.get(file_path, [])
+        return self._chunk_map.get(_normalize_path(file_path), [])
 
     def remove_file(self, file_path: str):
+        file_path = _normalize_path(file_path)
         self._files.pop(file_path, None)
         old = self._symbols.pop(file_path, None)
         if old:
@@ -113,6 +123,10 @@ class MetadataStore:
         self, current_fingerprints: dict[str, str]
     ) -> tuple[list[str], list[str], list[str]]:
         """Returns (new_files, modified_files, deleted_files)."""
+        current_fingerprints = {
+            _normalize_path(path): fingerprint
+            for path, fingerprint in current_fingerprints.items()
+        }
         stored = set(self._files.keys())
         current = set(current_fingerprints.keys())
         new_files = sorted(current - stored)
@@ -145,15 +159,21 @@ class MetadataStore:
     def _load(self):
         data = json.loads(self._store_path.read_text(encoding="utf-8"))
         self._files = {
-            k: self._dict_to_file(v) for k, v in data.get("files", {}).items()
+            _normalize_path(k): self._dict_to_file(v)
+            for k, v in data.get("files", {}).items()
         }
         self._symbols = {
-            k: [self._dict_to_symbol(s) for s in v]
+            _normalize_path(k): [self._dict_to_symbol(s) for s in v]
             for k, v in data.get("symbols", {}).items()
         }
-        self._chunk_map = data.get("chunk_map", {})
+        self._chunk_map = {
+            _normalize_path(k): v for k, v in data.get("chunk_map", {}).items()
+        }
         # Rebuild inverted name index
         self._name_index = {}
+        for symbols in self._symbols.values():
+            for sym in symbols:
+                sym.file_path = _normalize_path(sym.file_path)
         for symbols in self._symbols.values():
             for sym in symbols:
                 self._name_index.setdefault(sym.name.lower(), []).append(sym)
@@ -171,7 +191,7 @@ class MetadataStore:
     @staticmethod
     def _dict_to_file(d: dict) -> FileInfo:
         return FileInfo(
-            path=d["path"],
+            path=_normalize_path(d["path"]),
             sha256=d["sha256"],
             language=d["language"],
             size=d["size"],
@@ -194,7 +214,7 @@ class MetadataStore:
         return SymbolInfo(
             name=d["name"],
             kind=d["kind"],
-            file_path=d["file_path"],
+            file_path=_normalize_path(d["file_path"]),
             start_line=d["start_line"],
             end_line=d["end_line"],
             language=d["language"],

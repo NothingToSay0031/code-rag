@@ -103,6 +103,25 @@ Unchanged files are skipped entirely, so incremental updates are fast even on la
 
 ---
 
+## Testing
+
+Use the project virtual environment on Windows:
+
+```powershell
+# MCP smoke suite
+.\.venv\Scripts\python -m pytest -q tests\mcp_smoke\test_mcp_smoke.py
+
+# Unit tests
+.\.venv\Scripts\python -m pytest -q tests
+
+# Force rebuild index during smoke run
+$env:MCP_SMOKE_FORCE_REINDEX='1'; .\.venv\Scripts\python -m pytest -q tests\mcp_smoke\test_mcp_smoke.py
+```
+
+Smoke artifacts are written to `tests\artifacts\mcp-smoke\` by default.
+
+---
+
 ## Supported languages
 
 Python, JavaScript, TypeScript, C, C++, Java, C#, Rust, Go, Lua — plus documentation (Markdown, RST, plain text).

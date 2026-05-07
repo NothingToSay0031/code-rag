@@ -178,10 +178,13 @@ class BM25Store:
         if not tokens:
             return []
         scores = self._bm25.get_scores(tokens)
+        query_tokens = set(tokens)
         top_indices = scores.argsort()[::-1][:top_k]
         results = []
         for idx in top_indices:
-            if scores[idx] > 0:
+            # In very small corpora, rank_bm25 can assign zero IDF to matching
+            # terms. Keep real lexical hits instead of dropping them as no-match.
+            if scores[idx] > 0 or query_tokens.intersection(self._corpus[idx]):
                 results.append((self._chunks[idx], float(scores[idx])))
         return results
 
