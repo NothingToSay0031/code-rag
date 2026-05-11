@@ -104,10 +104,17 @@ class IndexPipeline:
                 abs_path
             )
 
+        print("Computing delta (new / modified / deleted files)...")
         new_files, modified_files, deleted_files = self._metadata.get_changed_files(
             current_fingerprints
         )
+        print(
+            f"  Delta: {len(new_files)} new, {len(modified_files)} modified, "
+            f"{len(deleted_files)} deleted"
+        )
 
+        if deleted_files:
+            print(f"  Cleaning up {len(deleted_files)} deleted files...")
         for file_path in deleted_files:
             self._vector_store.delete_by_file(file_path)
             self._bm25_store.remove_by_file(file_path)
@@ -115,6 +122,8 @@ class IndexPipeline:
 
         files_to_process = new_files + modified_files
 
+        if modified_files:
+            print(f"  Cleaning up {len(modified_files)} modified files...")
         for file_path in modified_files:
             self._vector_store.delete_by_file(file_path)
             self._bm25_store.remove_by_file(file_path)
@@ -124,6 +133,7 @@ class IndexPipeline:
         # Files parsed in a previous run (metadata saved at checkpoint) but
         # never fully embedded (no chunk_ids).  They need re-parsing because
         # chunk data is only held in memory.
+        print("Checking for partially-processed files from previous run...")
         resumed_files: list[str] = []
         already_scheduled = set(files_to_process)
         for fp in current_fingerprints:
@@ -321,7 +331,10 @@ class IndexPipeline:
                             import torch
 
                             if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
+                                try:
+                                    torch.cuda.empty_cache()
+                                except Exception:
+                                    pass
                                 try:
                                     torch.cuda.synchronize()
                                 except RuntimeError:
