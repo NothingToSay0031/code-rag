@@ -199,10 +199,8 @@ class Embedder:
             free_gb:  Free VRAM in GB (obtain once per encode call, reuse).
 
         Transformer self-attention memory scales as O(seq_len²).  We apply
-        this quadratic factor relative to a 512-token baseline and keep 35%
-        of free VRAM as a safety buffer for allocator overhead and
-        fragmentation (important on Windows where expandable_segments is
-        unsupported).
+        this quadratic factor relative to a 512-token baseline and keep a
+        safety buffer for allocator overhead and fragmentation.
         """
         if self._resolved_device != "cuda" or free_gb <= 0:
             return 64 if self._resolved_device != "cuda" else 8
@@ -223,13 +221,18 @@ class Embedder:
         seq_scale = max(1.0, (max(seq_len, 1) / 512) ** 2)
         per_sample_mb = base_per_sample_mb * seq_scale
 
-        # Keep 40% of free VRAM as buffer.  Windows CUDA allocator uses
-        # max_split_size_mb:128 which causes fragmentation over long runs;
-        # the extra headroom (was 50%) prevents late-batch OOM as the
-        # allocator drifts.  For very long sequences (4096 tokens) even
-        # the quadratic formula can underestimate real usage, so erring
-        # conservative is cheaper than a crash + checkpoint reload.
-        usable_gb = free_gb * 0.40
+        # On Windows the CUDA allocator uses max_split_size_mb:128, which
+        # causes fragmentation over long runs.  Reported free VRAM includes
+        # many small scattered blocks that cannot satisfy large contiguous
+        # allocations.  We reserve a larger buffer on Windows to compensate.
+        #
+        # For very long sequences (4096 tokens) even the quadratic formula
+        # can underestimate real usage, so erring conservative is cheaper
+        # than a crash + checkpoint reload.
+        if sys.platform == "win32":
+            usable_gb = free_gb * 0.20  # 80% buffer for Windows fragmentation
+        else:
+            usable_gb = free_gb * 0.40
         batch_size = max(1, int(usable_gb * 1024 / per_sample_mb))
         return min(batch_size, 128)
 
@@ -310,7 +313,11 @@ class Embedder:
 
                 # Periodically flush the Python GC and CUDA allocator cache
                 # to prevent cumulative drift from hundreds of encode() calls.
-                if groups_done % 50 == 0:
+                # On Windows, fragmentation builds up faster because
+                # expandable_segments is unsupported, so we refresh 3× more
+                # often (every 15 groups vs every 50).
+                _refresh_interval = 15 if sys.platform == "win32" else 50
+                if groups_done % _refresh_interval == 0:
                     gc.collect()
                     free_gb_no_flush = self._get_free_vram_gb(flush_cache=False)
                     free_gb = self._get_free_vram_gb()
@@ -377,6 +384,13 @@ class Embedder:
 
                 pbar.update(len(group_orig_idx))
                 pos = group_end
+
+                # On Windows the CUDA allocator fragments quickly (no
+                # expandable_segments).  Refresh free_gb after every group
+                # so the binary search in the next iteration uses a current
+                # reading instead of a stale one that may be 1–2 GB too high.
+                if sys.platform == "win32":
+                    free_gb = self._get_free_vram_gb()
         finally:
             pbar.close()
 
