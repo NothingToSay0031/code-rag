@@ -169,14 +169,6 @@ def discover_files(repo_path: Path, config: CodeRagConfig) -> list[Path]:
 
     # --- build pathspec matchers ------------------------------------------------
 
-    # .gitignore
-    gitignore_path = repo_path / ".gitignore"
-    if gitignore_path.is_file():
-        lines = gitignore_path.read_text(encoding="utf-8").splitlines()
-        gitignore_spec = PathSpec.from_lines("gitwildmatch", lines)
-    else:
-        gitignore_spec = None
-
     # .coderagfilter
     coderagfilter_path = repo_path / ".coderagfilter"
     filter_cfg = parse_coderagfilter(coderagfilter_path)
@@ -225,27 +217,16 @@ def discover_files(repo_path: Path, config: CodeRagConfig) -> list[Path]:
 
     def filter_file(abs_path: Path, rel: Path, rel_str: str) -> bool:
         """Apply path-based and I/O-based filters to a single file entry."""
-        # CLI --include overrides .gitignore/.coderagfilter (but not --exclude)
-        force_included = cli_include_spec and cli_include_spec.match_file(rel_str)
-
-        if not force_included:
-            # .gitignore
-            if gitignore_spec and gitignore_spec.match_file(rel_str):
-                if not (
-                    coderag_include_spec
-                    and coderag_include_spec.match_file(rel_str)
-                ):
-                    return False
-
-            # .coderagfilter excludes
-            if coderag_exclude_spec and coderag_exclude_spec.match_file(rel_str):
-                return False
-
-        # CLI --include: if specified, file must match
-        if cli_include_spec and not cli_include_spec.match_file(rel_str):
+        # .coderagfilter: exclude first, then include
+        if coderag_exclude_spec and coderag_exclude_spec.match_file(rel_str):
             return False
-        # CLI --exclude: highest priority
+        if coderag_include_spec and not coderag_include_spec.match_file(rel_str):
+            return False
+
+        # CLI: exclude first, then include
         if cli_exclude_spec and cli_exclude_spec.match_file(rel_str):
+            return False
+        if cli_include_spec and not cli_include_spec.match_file(rel_str):
             return False
 
         # Large file guard — code files are never skipped by size
