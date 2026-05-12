@@ -1,5 +1,5 @@
 from code_rag.storage.bm25_store import BM25Store
-from code_rag.models import Chunk, SearchResult
+from code_rag.models import SearchResult
 
 
 class KeywordRetriever:

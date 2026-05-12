@@ -75,7 +75,42 @@ This runs `git pull` in the detected code-rag repository root (a checkout that c
 --include PATTERN   Include only matching files (glob, repeatable)
 --exclude PATTERN   Exclude matching files (glob, repeatable)
 --device auto|cpu|cuda
+--model MODEL_NAME  Embedding model (see "Model selection" below)
 ```
+
+### Model selection
+
+| Model | Dims | Speed | Quality | GPU | RAM |
+|-------|------|-------|---------|-----|-----|
+| **`Qwen/Qwen3-Embedding-0.6B`** (default) | 1024 | ★☆☆ | ★★★ | CUDA recommended | ~2 GB |
+| `Qwen/Qwen3-Embedding-4B` | 2560 | ★☆☆ | ★★★ | CUDA required | ~8 GB |
+| `Qwen/Qwen3-Embedding-8B` | 4096 | ★☆☆ | ★★★ | CUDA required | ~16 GB |
+| `BAAI/bge-large-en-v1.5` | 1024 | ★★☆ | ★★☆ | Auto-detect | ~1.3 GB |
+| `minishlab/potion-code-16M` | 256 | ★★★ | ★☆☆ | Not needed | ~100 MB |
+
+**Qwen3** models are decoder-transformers that produce high-quality embeddings, especially for cross-language and complex semantic queries. The 0.6B variant is the default — it fits on most consumer GPUs and delivers strong retrieval accuracy on large repositories. 4B and 8B variants need workstation/server cards. CPU inference is prohibitively slow for all Qwen3 models; CUDA is strongly recommended.
+
+**potion-code-16M** is a static embedding model (~16M params, 256-dim) that runs entirely on CPU without a GPU. It is orders of magnitude faster than transformer-based models — a 20K-file codebase indexes in ~15 minutes instead of ~4 hours — but retrieval accuracy is significantly lower on large repositories. Only recommended when no GPU is available.
+
+**Switching models** per index:
+
+```bash
+# Default: high-quality GPU indexing
+code-rag init /path/to/repo
+
+# Fast CPU indexing (lower quality, no GPU needed)
+code-rag init /path/to/repo --model minishlab/potion-code-16M
+
+# Larger Qwen3 variants for even higher quality
+code-rag init /path/to/repo --model Qwen/Qwen3-Embedding-4B
+
+# Re-index an existing repo with a different model
+# (remove .code-rag/ first, or the old model's config will be reused)
+rm -rf /path/to/repo/.code-rag
+code-rag init /path/to/repo --model minishlab/potion-code-16M
+```
+
+Existing indices remember their model choice via `.code-rag/config.json`.  Re-running `init` without removing `.code-rag/` reuses the persisted model — this is by design so incremental updates don't silently switch models.
 
 > **PowerShell users**: PowerShell expands glob patterns before passing them to `code-rag`, causing `--include` / `--exclude` to malfunction. Use a `.coderagfilter` file in the repo root instead — it is never touched by the shell:
 >
@@ -141,4 +176,4 @@ Python, JavaScript, TypeScript, C, C++, Java, C#, Rust, Go, Lua — plus documen
 
 - Python 3.14+
 - ~500 MB disk per indexed repo (vectors + BM25 index)
-- RAM: ~1 GB for the embedding model (CPU), ~2 GB (GPU)
+- RAM: ~2 GB with default Qwen3-0.6B (GPU); ~100 MB with potion model (CPU)

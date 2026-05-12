@@ -30,6 +30,7 @@ MODEL_CONFIGS = {
     "Qwen/Qwen3-Embedding-0.6B": 1024,
     "Qwen/Qwen3-Embedding-4B": 2560,
     "Qwen/Qwen3-Embedding-8B": 4096,
+    "minishlab/potion-code-16M": 256,
 }
 
 BGE_QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
@@ -62,6 +63,11 @@ class Embedder:
         """Resolve device and model name without loading model."""
         if self._resolved_device is not None:
             return
+        # Static models (model2vec) are CPU-only by design — blazing fast
+        # without a GPU.  Force CPU to avoid unnecessary CUDA init.
+        if self._is_static():
+            self._resolved_device = "cpu"
+            return
         if self._device == "auto":
             try:
                 import torch
@@ -89,6 +95,11 @@ class Embedder:
         ):
             self._model_name = "BAAI/bge-large-en-v1.5"
 
+    def _is_static(self) -> bool:
+        """Return True if the model is a static embedding model (model2vec)."""
+        name = self._model_name.lower()
+        return "potion" in name or "model2vec" in name
+
     @property
     def tokenizer(self):
         """Get the model's tokenizer without loading model weights.
@@ -97,6 +108,11 @@ class Embedder:
         """
         if self._tokenizer_obj is None:
             self._resolve_device()
+            # Static models (model2vec) don't have HuggingFace tokenizers.
+            # The chunker falls back to whitespace-split word count via
+            # _count_tokens_fast when _tokenizer_obj is None.
+            if self._is_static():
+                return None
             from transformers import AutoTokenizer
 
             self._tokenizer_obj = AutoTokenizer.from_pretrained(self._model_name)
@@ -106,6 +122,11 @@ class Embedder:
         if self._model is not None:
             return
         self._resolve_device()
+
+        # Static models (model2vec) are CPU-only, no ONNX/GPU paths apply.
+        if self._is_static():
+            self._load_static()
+            return
 
         if self._resolved_device == "cpu" and "qwen3" not in self._model_name.lower():
             # Try ONNX Runtime first for CPU (faster inference).
@@ -119,6 +140,22 @@ class Embedder:
 
         # Fallback / GPU path: sentence-transformers + torch
         self._load_sentence_transformers()
+
+    def _load_static(self):
+        """Load a static embedding model via model2vec (CPU-only, ultra-fast)."""
+        print(f"Loading {self._model_name} (static / model2vec)...")
+        try:
+            from model2vec import StaticModel
+
+            self._model = StaticModel.from_pretrained(self._model_name)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load static model '{self._model_name}'. "
+                f"Check network connection and model availability on "
+                f"HuggingFace Hub: https://huggingface.co/{self._model_name}"
+            ) from exc
+        self._backend = "static"
+        print(f"Model loaded (static). Dimension: {self.dimension}")
 
     def _load_onnx(self):
         """Load model with ONNX Runtime backend via sentence-transformers."""
@@ -265,11 +302,26 @@ class Embedder:
            long groups get batch_size ≈ 6–12.
         4. Calls :meth:`_encode_with_retry` per group (OOM halving is
            contained to the small group, not the full 5 000-chunk list).
+
+        Static models (model2vec) bypass all of this — they encode in one shot
+        on CPU with no VRAM concerns.
         """
         self._ensure_loaded()
 
         if not texts:
             return np.empty((0, self.dimension), dtype=np.float32)
+
+        # --- Static model fast-path (CPU, no batching overhead) ------------
+        if self._is_static():
+            embeddings = self._model.encode(
+                texts,
+                show_progress_bar=True,
+                max_length=self._max_seq_length,  # None = no truncation
+            )
+            # L2-normalize (model2vec returns raw embeddings)
+            norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+            norms = np.where(norms == 0, 1.0, norms)
+            return embeddings / norms
 
         # --- CPU fast-path: no memory pressure, single encode call ----------
         if self._resolved_device != "cuda":
@@ -321,11 +373,11 @@ class Embedder:
                     gc.collect()
                     free_gb_no_flush = self._get_free_vram_gb(flush_cache=False)
                     free_gb = self._get_free_vram_gb()
-                    pbar.write(
-                        f"  [VRAM refresh @ group {groups_done}] "
-                        f"free: {free_gb_no_flush:.1f} GB "
-                        f"(after flush: {free_gb:.1f} GB)"
-                    )
+                    # pbar.write(
+                    #     f"  [VRAM refresh @ group {groups_done}] "
+                    #     f"free: {free_gb_no_flush:.1f} GB "
+                    #     f"(after flush: {free_gb:.1f} GB)"
+                    # )
 
                 group_min_len = lengths[sorted_idx[pos]]
 
@@ -498,6 +550,14 @@ class Embedder:
         """Embed a query with the appropriate instruction prefix for the model."""
         self._ensure_loaded()
         assert self._model is not None  # _ensure_loaded always sets this
+        if self._is_static():
+            # Static models encode queries and documents identically — no
+            # instruction prefix is needed or supported.
+            emb = np.asarray(self._model.encode([query], max_length=None)[0])
+            norm = np.linalg.norm(emb)
+            if norm > 0:
+                emb = emb / norm
+            return emb
         if "qwen3" in self._model_name.lower():
             # Qwen3 Embedding uses an explicit instruction header on the query side.
             # Documents are encoded without any prefix.
@@ -514,4 +574,7 @@ class Embedder:
     @property
     def dimension(self) -> int:
         self._resolve_device()
+        # Prefer the loaded model's actual dimension when available
+        if self._model is not None and self._is_static():
+            return self._model.dim
         return MODEL_CONFIGS.get(self._model_name, 384)

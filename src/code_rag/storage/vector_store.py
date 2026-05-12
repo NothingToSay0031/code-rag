@@ -166,14 +166,60 @@ class VectorStore:
             output.append(entry)
         return output
 
+    def delete_by_ids(self, ids: list[int]) -> int:
+        """Delete chunks by explicit ID list (fast hashmap lookup).
+
+        Much faster than metadata-filter deletion for bulk operations.
+        Returns the number of IDs submitted for deletion.
+        """
+        if not self._available or not ids:
+            return 0
+        str_ids = [str(i) for i in ids]
+        batch_size = 10_000
+        for start in range(0, len(str_ids), batch_size):
+            self._collection.delete(ids=str_ids[start : start + batch_size])
+        return len(ids)
+
     def delete_by_file(self, file_path: str):
-        if not self._available:
+        self.delete_by_files([file_path])
+
+    def delete_by_files(
+        self,
+        file_paths: list[str],
+        chunk_ids_map: dict[str, list[int]] | None = None,
+    ):
+        """Batch-delete chunks for multiple files.
+
+        When *chunk_ids_map* is provided, uses fast ID-based deletion
+        (O(n) hashmap lookup) instead of slow metadata-filter scan.
+        """
+        if not self._available or not file_paths:
             return
-        # ChromaDB delete with where filter; no-op if nothing matches
+
+        # Fast path: ID-based deletion
+        if chunk_ids_map:
+            all_ids: list[int] = []
+            for fp in file_paths:
+                ids = chunk_ids_map.get(fp, [])
+                all_ids.extend(ids)
+            if all_ids:
+                self.delete_by_ids(all_ids)
+            return
+
+        # Slow path: metadata-filter deletion (legacy / fallback)
         try:
-            self._collection.delete(where={"file_path": file_path})
+            if len(file_paths) == 1:
+                self._collection.delete(where={"file_path": file_paths[0]})
+            else:
+                self._collection.delete(
+                    where={"$or": [{"file_path": fp} for fp in file_paths]}
+                )
         except Exception:
-            pass
+            for fp in file_paths:
+                try:
+                    self._collection.delete(where={"file_path": fp})
+                except Exception:
+                    pass
 
     def get_by_file(self, file_path: str) -> list[dict]:
         if not self._available:

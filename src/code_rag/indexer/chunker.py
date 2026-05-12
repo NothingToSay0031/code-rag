@@ -18,9 +18,14 @@ def set_tokenizer(tokenizer) -> None:
     When set, :func:`count_tokens` and :func:`sliding_window_split` use the
     real tokenizer instead of word-based approximation.  Call this once at
     pipeline startup with the embedding model's tokenizer.
+
+    Pass ``None`` to clear the tokenizer (e.g. for static models that have
+    no HuggingFace tokenizer).
     """
     global _tokenizer
     _tokenizer = tokenizer
+    if tokenizer is None:
+        return
     # Remove the model_max_length constraint so encode() doesn't emit
     # "Token indices sequence length is longer than the specified maximum
     # sequence length" warnings when we're only counting tokens.

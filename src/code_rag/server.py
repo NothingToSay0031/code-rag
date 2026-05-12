@@ -534,9 +534,9 @@ def search_code(
 ) -> str:
     """Semantic + BM25 hybrid code search. Use for concept/behavior queries when the exact symbol name is unknown. If you already know the identifier, use get_symbol_info instead.
 
-    Expensive (two retrieval passes). Read all results before calling again; use read_code to expand truncated snippets; use offset to paginate.
+    Token‑heavy (top_k results). Read all results before calling again; use read_code to expand truncated snippets; use offset to paginate.
 
-    Snippet size scales with top_k: ≤3→200 ln, ≤5→150, ≤10→100, >10→80-100. Oversized chunks show per-symbol previews (▸ kind name L#). Use read_code to expand any result.
+    Snippet size scales with top_k. Oversized chunks show per-symbol previews (▸ kind name L#). Use read_code to expand any result.
 
     Args:
         query: Concept/behavior description, not an exact identifier.

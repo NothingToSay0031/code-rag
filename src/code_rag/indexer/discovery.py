@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import threading
 from pathlib import Path
+from queue import Queue
 
 from pathspec import PathSpec
 from tqdm import tqdm
@@ -157,9 +160,10 @@ def get_file_fingerprint(path: Path) -> str:
 def discover_files(repo_path: Path, config: CodeRagConfig) -> list[Path]:
     """Walk *repo_path* and return a sorted list of relative ``Path`` objects.
 
-    Applies a chain of filters: hidden dirs, junk dirs, .gitignore,
-    .coderagfilter, CLI include/exclude patterns, binary detection and a 2 MB
-    size guard.  Symlinks are followed with cycle detection.
+    Uses a parallel producer-consumer pattern: worker threads pull
+    directories from a shared queue, list them with ``os.scandir()``,
+    push subdirectories back, and filter files in parallel.  Symlinks
+    are followed with cycle detection.
     """
     repo_path = repo_path.resolve()
 
@@ -200,10 +204,16 @@ def discover_files(repo_path: Path, config: CodeRagConfig) -> list[Path]:
     else:
         cli_exclude_spec = None
 
-    # --- walk -------------------------------------------------------------------
+    # --- parallel tree walk -----------------------------------------------------
+
+    max_workers = min(8, (os.cpu_count() or 4))
+    dir_queue: Queue[Path | None] = Queue()
+    dir_queue.put(repo_path)
 
     visited: set[Path] = set()
-    result: list[Path] = []
+    visited_lock = threading.Lock()
+
+    thread_results: list[list[Path]] = [[] for _ in range(max_workers)]
 
     pbar = tqdm(
         desc="Scanning",
@@ -211,97 +221,132 @@ def discover_files(repo_path: Path, config: CodeRagConfig) -> list[Path]:
         mininterval=0.2,
         leave=False,
     )
-    try:
-        for entry in repo_path.rglob("*"):
-            pbar.update(1)
+    pbar_lock = threading.Lock()
 
-            # Only files
-            if not entry.is_file():
-                continue
+    def filter_file(abs_path: Path, rel: Path, rel_str: str) -> bool:
+        """Apply path-based and I/O-based filters to a single file entry."""
+        # CLI --include overrides .gitignore/.coderagfilter (but not --exclude)
+        force_included = cli_include_spec and cli_include_spec.match_file(rel_str)
 
-            # Symlink cycle detection
+        if not force_included:
+            # .gitignore
+            if gitignore_spec and gitignore_spec.match_file(rel_str):
+                if not (
+                    coderag_include_spec
+                    and coderag_include_spec.match_file(rel_str)
+                ):
+                    return False
+
+            # .coderagfilter excludes
+            if coderag_exclude_spec and coderag_exclude_spec.match_file(rel_str):
+                return False
+
+        # CLI --include: if specified, file must match
+        if cli_include_spec and not cli_include_spec.match_file(rel_str):
+            return False
+        # CLI --exclude: highest priority
+        if cli_exclude_spec and cli_exclude_spec.match_file(rel_str):
+            return False
+
+        # Large file guard — code files are never skipped by size
+        try:
+            size = abs_path.stat().st_size
+        except OSError:
+            return False
+
+        file_lang = detect_language(abs_path, config.custom_type_mappings)
+
+        if file_lang is None:
+            return False
+
+        is_code = file_lang in _CODE_LANGUAGES
+
+        if size > _MAX_FILE_SIZE and not is_code:
+            print(f"Warning: skipping large non-code file ({size} bytes): {rel}")
+            return False
+
+        # Binary detection (empty files pass through)
+        if size > 0:
             try:
-                resolved = entry.resolve()
+                chunk = abs_path.read_bytes()[:_BINARY_CHECK_SIZE]
+                if b"\x00" in chunk:
+                    return False
             except OSError:
-                continue
-            if resolved in visited:
-                continue
-            visited.add(resolved)
+                return False
 
-            # Relative path for pattern matching (use forward-slash string)
-            rel = entry.relative_to(repo_path)
-            parts = rel.parts
+        return True
 
-            # (a) Skip hidden directories
-            if any(p.startswith(".") and p != "." for p in parts[:-1]):
-                continue
+    def worker(thread_id: int) -> None:
+        local_results = thread_results[thread_id]
+        while True:
+            dir_path = dir_queue.get()
+            if dir_path is None:  # shutdown sentinel
+                dir_queue.task_done()
+                break
 
-            # (b) Skip junk directories
-            if any(p in _JUNK_DIRS for p in parts[:-1]):
-                continue
-
-            # Use forward-slash relative string for pathspec matching
-            rel_str = rel.as_posix()
-
-            # CLI --include overrides .gitignore/.coderagfilter (but not --exclude).
-            force_included = cli_include_spec and cli_include_spec.match_file(rel_str)
-
-            if not force_included:
-                # (c) .gitignore
-                if gitignore_spec and gitignore_spec.match_file(rel_str):
-                    # Check .coderagfilter include (re-include overrides .gitignore)
-                    if not (
-                        coderag_include_spec
-                        and coderag_include_spec.match_file(rel_str)
-                    ):
-                        continue
-
-                # (d) .coderagfilter excludes — always respected; include
-                #     only overrides *external* ignores (.gitignore), not
-                #     excludes from the same .coderagfilter file.
-                if coderag_exclude_spec and coderag_exclude_spec.match_file(rel_str):
-                    continue
-
-            # (e) CLI --include: if specified, file must match
-            if cli_include_spec and not cli_include_spec.match_file(rel_str):
-                continue
-            # CLI --exclude: highest priority — always respected, overrides --include
-            if cli_exclude_spec and cli_exclude_spec.match_file(rel_str):
-                continue
-
-            # Large file guard — code files are never skipped by size
             try:
-                size = entry.stat().st_size
-            except OSError:
-                continue
+                for entry in os.scandir(dir_path):
+                    with pbar_lock:
+                        pbar.update(1)
 
-            file_lang = detect_language(entry, config.custom_type_mappings)
+                    entry_path = Path(entry.path)
 
-            # Skip files with unrecognised extensions — they would be classified
-            # as "unknown" in the pipeline and discarded anyway.  Skipping early
-            # avoids unnecessary I/O (reading bytes for binary detection, hashing).
-            if file_lang is None:
-                continue
-
-            is_code = file_lang in _CODE_LANGUAGES
-
-            if size > _MAX_FILE_SIZE and not is_code:
-                print(f"Warning: skipping large non-code file ({size} bytes): {rel}")
-                continue
-
-            # Binary detection (empty files pass through)
-            if size > 0:
-                try:
-                    chunk = entry.read_bytes()[:_BINARY_CHECK_SIZE]
-                    if b"\x00" in chunk:
+                    # Symlink cycle detection
+                    try:
+                        resolved = entry_path.resolve()
+                    except OSError:
                         continue
-                except OSError:
-                    continue
+                    with visited_lock:
+                        if resolved in visited:
+                            continue
+                        visited.add(resolved)
 
-            result.append(rel)
-            pbar.set_postfix(found=len(result), refresh=False)
-    finally:
-        pbar.close()
+                    if entry.is_dir(follow_symlinks=False):
+                        rel = entry_path.relative_to(repo_path)
+                        parts = rel.parts
 
+                        # Skip hidden directories
+                        if any(p.startswith(".") and p != "." for p in parts):
+                            continue
+                        # Skip junk directories
+                        if any(p in _JUNK_DIRS for p in parts):
+                            continue
+
+                        dir_queue.put(entry_path)
+
+                    elif entry.is_file(follow_symlinks=False):
+                        rel = entry_path.relative_to(repo_path)
+                        rel_str = rel.as_posix()
+
+                        if filter_file(entry_path, rel, rel_str):
+                            local_results.append(rel)
+            except OSError:
+                pass
+            finally:
+                dir_queue.task_done()
+
+    threads = [
+        threading.Thread(target=worker, args=(i,), daemon=True)
+        for i in range(max_workers)
+    ]
+    for t in threads:
+        t.start()
+
+    # Wait until all directory listings are complete
+    dir_queue.join()
+
+    # Tell workers to exit
+    for _ in range(max_workers):
+        dir_queue.put(None)
+
+    for t in threads:
+        t.join()
+
+    pbar.close()
+
+    # Merge per-thread results
+    result: list[Path] = []
+    for tr in thread_results:
+        result.extend(tr)
     result.sort()
     return result
