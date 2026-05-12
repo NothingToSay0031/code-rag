@@ -144,10 +144,16 @@ class BM25Store:
         self._dirty = True
 
     def remove_by_file(self, file_path: str):
-        indices = self._file_map.pop(file_path, [])
-        if not indices:
+        self.remove_by_files([file_path])
+
+    def remove_by_files(self, file_paths: list[str]):
+        """Batch-remove multiple files in a single pass over the corpus."""
+        remove_set: set[int] = set()
+        for fp in file_paths:
+            indices = self._file_map.pop(fp, [])
+            remove_set.update(indices)
+        if not remove_set:
             return
-        remove_set = set(indices)
         new_corpus = []
         new_doc_ids = []
         new_chunks = []

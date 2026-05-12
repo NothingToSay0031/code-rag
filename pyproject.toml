@@ -26,6 +26,7 @@ dependencies = [
     "rank-bm25",
     "click",
     "pathspec",
+    "model2vec>=0.8",
 ]
 
 # NOTE: torch is NOT listed here. CUDA vs CPU torch is handled entirely

@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import importlib
 import re
+import threading
 import warnings
 from dataclasses import dataclass, field
 
@@ -176,6 +177,7 @@ IDENTIFIER_NODE_TYPES = {
 }
 
 _parser_cache: dict[str, Parser] = {}
+_parser_cache_lock = threading.Lock()
 
 
 @dataclass
@@ -204,13 +206,18 @@ def get_parser(language: str) -> Parser:
     if parser is not None:
         return parser
 
-    config = LANGUAGE_CONFIGS[resolved_language]
-    module = importlib.import_module(config.module)
-    language_factory = getattr(module, config.factory)
-    parser = Parser()
-    parser.language = Language(language_factory())
-    _parser_cache[resolved_language] = parser
-    return parser
+    with _parser_cache_lock:
+        parser = _parser_cache.get(resolved_language)
+        if parser is not None:
+            return parser
+
+        config = LANGUAGE_CONFIGS[resolved_language]
+        module = importlib.import_module(config.module)
+        language_factory = getattr(module, config.factory)
+        parser = Parser()
+        parser.language = Language(language_factory())
+        _parser_cache[resolved_language] = parser
+        return parser
 
 
 def parse_file(source: bytes, language: str) -> Tree:

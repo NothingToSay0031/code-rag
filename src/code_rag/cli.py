@@ -23,6 +23,9 @@ _MCP_CLIENTS = {
         "files": [".opencode/opencode.json"],
         "schema": "https://opencode.ai/config.json",
     },
+    "claude": {
+        "files": [".mcp.json"],
+    },
 }
 
 
@@ -88,6 +91,15 @@ def _write_project_mcp_configs(
                 update = {"mcp": {"code-rag": mcp_entry_with_timeout}}
                 if "schema" in info:
                     update["$schema"] = info["schema"]  # type: ignore[assignment]
+            elif client == "claude":
+                update = {
+                    "mcpServers": {
+                        "code-rag": {
+                            "command": executable,
+                            "args": ["serve", "--repo", repo_abs],
+                        }
+                    }
+                }
             else:
                 continue
             _merge_json_file(target, update)
@@ -395,7 +407,7 @@ def serve(repo_path: str, transport: str, port: int):
     "--client",
     "clients",
     multiple=True,
-    type=click.Choice(["opencode"]),
+    type=click.Choice(["opencode", "claude"]),
     default=["opencode"],
     show_default=True,
     help="Which AI clients to configure (can repeat)",
@@ -435,6 +447,9 @@ def _setup_global_mcp(executable: str, clients: list[str]) -> None:
         "opencode": [
             home / ".config" / "opencode" / "opencode.json",
         ],
+        "claude": [
+            home / ".claude.json",
+        ],
     }
 
     for client in clients:
@@ -450,6 +465,15 @@ def _setup_global_mcp(executable: str, clients: list[str]) -> None:
                             "enabled": True,
                         }
                     },
+                }
+            elif client == "claude":
+                update = {
+                    "mcpServers": {
+                        "code-rag": {
+                            "command": executable,
+                            "args": ["serve"],
+                        }
+                    }
                 }
             else:
                 continue

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import gc
+import os
+import threading
 import time
-from dataclasses import dataclass, replace
+from concurrent.futures import as_completed, ThreadPoolExecutor
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePath
+from queue import Queue
 
 from tqdm import tqdm
 
@@ -33,9 +37,130 @@ class IndexStats:
     elapsed_seconds: float
 
 
+@dataclass
+class _FileProcessResult:
+    """Result from a worker thread that parsed and chunked one file."""
+
+    file_path_str: str
+    status: str  # "success", "unknown", "no_chunks", "error"
+    chunks: list = field(default_factory=list)
+    symbols: list = field(default_factory=list)
+    file_info: FileInfo | None = None
+
+
 def _relative_path_key(path: PurePath) -> str:
     """Return the canonical relative path key used by metadata and stores."""
     return path.as_posix()
+
+
+def _parse_and_chunk_file(
+    file_path_str: str,
+    repo_path: Path,
+    fingerprint: str,
+    custom_type_mappings: dict[str, str] | None,
+    max_chunk_tokens: int,
+) -> _FileProcessResult:
+    """Read, parse and chunk a single file.  Designed for use inside a
+    ``ThreadPoolExecutor`` — tree-sitter (C) and file I/O release the GIL,
+    so real parallelism is achieved in the thread pool."""
+    abs_path = repo_path / file_path_str
+
+    try:
+        content = abs_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        try:
+            content = abs_path.read_text(encoding="latin-1")
+        except Exception:
+            return _FileProcessResult(file_path_str, "error")
+    except Exception:
+        return _FileProcessResult(file_path_str, "error")
+
+    language = detect_language(abs_path, custom_type_mappings)
+    file_type = classify_file(abs_path, language)
+
+    if file_type == "unknown":
+        return _FileProcessResult(
+            file_path_str,
+            "unknown",
+            file_info=FileInfo(
+                path=file_path_str,
+                sha256=fingerprint,
+                language=None,
+                size=abs_path.stat().st_size,
+                chunk_count=0,
+            ),
+        )
+
+    symbols = []
+    if file_type == "code" and language:
+        try:
+            source_bytes = content.encode("utf-8")
+            tree = parse_file(source_bytes, language)
+            symbols = extract_symbols(tree, source_bytes, language)
+            for symbol in symbols:
+                symbol.file_path = file_path_str
+        except Exception:
+            symbols = []
+
+    chunks = chunk_file(
+        content, file_path_str, language, file_type, max_chunk_tokens
+    )
+
+    if not chunks:
+        return _FileProcessResult(
+            file_path_str,
+            "no_chunks",
+            file_info=FileInfo(
+                path=file_path_str,
+                sha256=fingerprint,
+                language=language,
+                size=abs_path.stat().st_size,
+                chunk_count=0,
+            ),
+        )
+
+    return _FileProcessResult(
+        file_path_str,
+        "success",
+        chunks=chunks,
+        symbols=symbols,
+        file_info=FileInfo(
+            path=file_path_str,
+            sha256=fingerprint,
+            language=language,
+            size=abs_path.stat().st_size,
+            chunk_count=len(chunks),
+        ),
+    )
+
+
+def _read_and_chunk_for_bm25(
+    file_path_str: str,
+    repo_path: Path,
+    language: str,
+    max_chunk_tokens: int,
+) -> tuple[str, list | None]:
+    """Read a file and chunk it for BM25 rebuild.  Returns ``(path, chunks)``
+    or ``(path, None)`` when the file cannot be read/chunked."""
+    abs_path = repo_path / file_path_str
+    if not abs_path.exists():
+        return file_path_str, None
+
+    try:
+        content = abs_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        try:
+            content = abs_path.read_text(encoding="latin-1")
+        except Exception:
+            return file_path_str, None
+    except Exception:
+        return file_path_str, None
+
+    file_type = classify_file(abs_path, language)
+    chunks = chunk_file(
+        content, file_path_str, language, file_type, max_chunk_tokens
+    )
+    return file_path_str, chunks if chunks else None
 
 
 class IndexPipeline:
@@ -72,9 +197,9 @@ class IndexPipeline:
 
         Args:
             checkpoint_every: Max chunks per embedding checkpoint batch.
-                After each batch, metadata + bm25 + vectors are persisted so
-                the process can resume from the last checkpoint on crash.
-                Default is 5k chunks.
+                Default is 5k chunks.  For static models (model2vec) that
+                have no VRAM pressure, the default is automatically raised
+                to 50k to reduce I/O overhead.
         """
         start = time.time()
 
@@ -98,11 +223,21 @@ class IndexPipeline:
         print(f"Discovered {len(files)} files")
 
         current_fingerprints: dict[str, str] = {}
-        for file_path in tqdm(files, desc="Fingerprinting", unit="file"):
-            abs_path = config.repo_path / file_path
-            current_fingerprints[_relative_path_key(file_path)] = get_file_fingerprint(
-                abs_path
-            )
+        max_workers = min(8, (os.cpu_count() or 4))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_to_path: dict = {}
+            for file_path in files:
+                abs_path = config.repo_path / file_path
+                future_to_path[
+                    pool.submit(get_file_fingerprint, abs_path)
+                ] = _relative_path_key(file_path)
+
+            for future in tqdm(
+                as_completed(future_to_path), desc="Fingerprinting", unit="file",
+                total=len(files),
+            ):
+                key = future_to_path[future]
+                current_fingerprints[key] = future.result()
 
         print("Computing delta (new / modified / deleted files)...")
         new_files, modified_files, deleted_files = self._metadata.get_changed_files(
@@ -115,19 +250,29 @@ class IndexPipeline:
 
         if deleted_files:
             print(f"  Cleaning up {len(deleted_files)} deleted files...")
-        for file_path in deleted_files:
-            self._vector_store.delete_by_file(file_path)
-            self._bm25_store.remove_by_file(file_path)
-            self._metadata.remove_file(file_path)
+            deleted_chunk_ids: dict[str, list[int]] = {}
+            for fp in deleted_files:
+                cids = self._metadata.get_chunk_ids(fp)
+                if cids:
+                    deleted_chunk_ids[fp] = cids
+            self._vector_store.delete_by_files(deleted_files, deleted_chunk_ids)
+            self._bm25_store.remove_by_files(deleted_files)
+            for file_path in deleted_files:
+                self._metadata.remove_file(file_path)
 
         files_to_process = new_files + modified_files
 
         if modified_files:
             print(f"  Cleaning up {len(modified_files)} modified files...")
-        for file_path in modified_files:
-            self._vector_store.delete_by_file(file_path)
-            self._bm25_store.remove_by_file(file_path)
-            self._metadata.remove_file(file_path)
+            modified_chunk_ids: dict[str, list[int]] = {}
+            for fp in modified_files:
+                cids = self._metadata.get_chunk_ids(fp)
+                if cids:
+                    modified_chunk_ids[fp] = cids
+            self._vector_store.delete_by_files(modified_files, modified_chunk_ids)
+            self._bm25_store.remove_by_files(modified_files)
+            for file_path in modified_files:
+                self._metadata.remove_file(file_path)
 
         # -- Resume detection --------------------------------------------------
         # Files parsed in a previous run (metadata saved at checkpoint) but
@@ -162,82 +307,130 @@ class IndexPipeline:
         # == Phase 1: Parse & chunk ============================================
         all_file_chunks: dict[str, list] = {}
 
-        for file_path_str in tqdm(
-            files_to_process, desc="Parsing & chunking", unit="file"
-        ):
-            abs_path = config.repo_path / file_path_str
+        # Using daemon threads so that if one gets stuck in tree-sitter C code
+        # the process can still exit.  Results flow back through a thread-safe
+        # queue and the main thread collects them with a per-file timeout.
+        work_items = list(files_to_process)
+        work_lock = threading.Lock()
+        work_idx = 0
+        result_queue: Queue[_FileProcessResult | None] = Queue()
 
+        def worker() -> None:
+            nonlocal work_idx
+            while True:
+                with work_lock:
+                    if work_idx >= len(work_items):
+                        return
+                    file_path_str = work_items[work_idx]
+                    work_idx += 1
+
+                result = _parse_and_chunk_file(
+                    file_path_str,
+                    config.repo_path,
+                    current_fingerprints[file_path_str],
+                    config.custom_type_mappings,
+                    config.max_chunk_tokens,
+                )
+                result_queue.put(result)
+
+        threads = [
+            threading.Thread(target=worker, daemon=True)
+            for _ in range(max_workers)
+        ]
+        for t in threads:
+            t.start()
+
+        PARALLEL_TIMEOUT = 120
+        collected = 0
+        total = len(files_to_process)
+        pbar = tqdm(total=total, desc="Parsing & chunking", unit="file")
+
+        while collected < total:
             try:
-                content = abs_path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
+                result = result_queue.get(timeout=PARALLEL_TIMEOUT)
+            except Exception:  # queue.Empty
+                break
+
+            if result is None:
+                continue
+
+            collected += 1
+            pbar.update(1)
+
+            if result.status == "error":
+                self._metadata.remove_file(result.file_path_str)
+            elif result.status in ("unknown", "no_chunks"):
+                self._metadata.set_file_info(
+                    result.file_path_str, result.file_info
+                )
+            elif result.status == "success":
+                all_file_chunks[result.file_path_str] = result.chunks
+                self._metadata.set_file_info(
+                    result.file_path_str, result.file_info
+                )
+                self._metadata.set_symbols(
+                    result.file_path_str, result.symbols
+                )
+
+        # Collect files that didn't complete in the parallel phase
+        with work_lock:
+            stuck = [work_items[i] for i in range(work_idx, len(work_items))]
+
+        pbar.close()
+
+        # -- Retry stuck files with per-file timeout -------------------------------
+        # Tree-sitter can hang on certain files (large generated C, shaders).
+        # Process each file in a daemon thread with a per-file timeout so a
+        # single stuck file doesn't block the entire retry.
+        if stuck:
+            PER_FILE_TIMEOUT = 30
+            skipped_timeout = 0
+            print(
+                f"\n{len(stuck)} file(s) timed out in parallel parse. "
+                f"Retrying single-threaded (per-file timeout={PER_FILE_TIMEOUT}s)..."
+            )
+            pbar2 = tqdm(stuck, desc="Parsing (retry)", unit="file")
+            for file_path_str in pbar2:
+                q: Queue[_FileProcessResult | None] = Queue()
+
+                def _worker(fp: str = file_path_str) -> None:
+                    r = _parse_and_chunk_file(
+                        fp,
+                        config.repo_path,
+                        current_fingerprints[fp],
+                        config.custom_type_mappings,
+                        config.max_chunk_tokens,
+                    )
+                    q.put(r)
+
+                t = threading.Thread(target=_worker, daemon=True)
+                t.start()
                 try:
-                    content = abs_path.read_text(encoding="latin-1")
+                    result = q.get(timeout=PER_FILE_TIMEOUT)
                 except Exception:
-                    self._metadata.remove_file(file_path_str)
+                    skipped_timeout += 1
                     continue
-            except Exception:
-                self._metadata.remove_file(file_path_str)
-                continue
 
-            language = detect_language(abs_path, config.custom_type_mappings)
-            file_type = classify_file(abs_path, language)
-            if file_type == "unknown":
-                self._metadata.set_file_info(
-                    file_path_str,
-                    FileInfo(
-                        path=file_path_str,
-                        sha256=current_fingerprints[file_path_str],
-                        language=None,
-                        size=abs_path.stat().st_size,
-                        chunk_count=0,
-                    ),
+                if result.status == "error":
+                    self._metadata.remove_file(result.file_path_str)
+                elif result.status in ("unknown", "no_chunks"):
+                    self._metadata.set_file_info(
+                        result.file_path_str, result.file_info
+                    )
+                elif result.status == "success":
+                    all_file_chunks[result.file_path_str] = result.chunks
+                    self._metadata.set_file_info(
+                        result.file_path_str, result.file_info
+                    )
+                    self._metadata.set_symbols(
+                        result.file_path_str, result.symbols
+                    )
+            pbar2.close()
+            if skipped_timeout:
+                print(
+                    f"  Skipped {skipped_timeout} file(s) due to "
+                    f"{PER_FILE_TIMEOUT}s parse timeout"
                 )
-                continue
-
-            symbols = []
-            if file_type == "code" and language:
-                try:
-                    source_bytes = content.encode("utf-8")
-                    tree = parse_file(source_bytes, language)
-                    symbols = extract_symbols(tree, source_bytes, language)
-                    for symbol in symbols:
-                        symbol.file_path = file_path_str
-                except Exception:
-                    symbols = []
-
-            chunks = chunk_file(
-                content,
-                file_path_str,
-                language,
-                file_type,
-                config.max_chunk_tokens,
-            )
-            if not chunks:
-                self._metadata.set_file_info(
-                    file_path_str,
-                    FileInfo(
-                        path=file_path_str,
-                        sha256=current_fingerprints[file_path_str],
-                        language=language,
-                        size=abs_path.stat().st_size,
-                        chunk_count=0,
-                    ),
-                )
-                continue
-
-            all_file_chunks[file_path_str] = chunks
-
-            self._metadata.set_file_info(
-                file_path_str,
-                FileInfo(
-                    path=file_path_str,
-                    sha256=current_fingerprints[file_path_str],
-                    language=language,
-                    size=abs_path.stat().st_size,
-                    chunk_count=len(chunks),
-                ),
-            )
-            self._metadata.set_symbols(file_path_str, symbols)
 
         # -- Checkpoint after parsing ------------------------------------------
         self._metadata.save()
@@ -248,6 +441,11 @@ class IndexPipeline:
         )
 
         # == Phase 2: Embed in batches with checkpoints ========================
+        # Static models (model2vec) have no VRAM pressure — checkpoint I/O is
+        # pure overhead.  Build a single batch so we only persist at the end.
+        if self._embedder._is_static():
+            checkpoint_every = max(checkpoint_every, total_chunks + 1)
+
         # Batch by chunk count (not file count) for uniform batch sizes.
         # Sort files by average chunk length (ascending) so that short-chunk
         # files (headers, shaders) fill early batches and benefit from large
@@ -464,46 +662,37 @@ class IndexPipeline:
         )
 
         rebuilt = 0
-        for file_path_str in tqdm(
-            files_needing_bm25, desc="Rebuilding BM25", unit="file"
-        ):
-            abs_path = config.repo_path / file_path_str
-            if not abs_path.exists():
-                continue
-
-            try:
-                content = abs_path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                try:
-                    content = abs_path.read_text(encoding="latin-1")
-                except Exception:
+        max_workers = min(8, (os.cpu_count() or 4))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_to_path: dict = {}
+            for file_path_str in files_needing_bm25:
+                info = self._metadata.get_file_info(file_path_str)
+                if not info or not info.language:
                     continue
-            except Exception:
-                continue
+                future_to_path[
+                    pool.submit(
+                        _read_and_chunk_for_bm25,
+                        file_path_str,
+                        config.repo_path,
+                        info.language,
+                        config.max_chunk_tokens,
+                    )
+                ] = file_path_str
 
-            info = self._metadata.get_file_info(file_path_str)
-            if not info or not info.language:
-                continue
+            for future in tqdm(
+                as_completed(future_to_path), desc="Rebuilding BM25", unit="file",
+                total=len(future_to_path),
+            ):
+                file_path_str, chunks = future.result()
+                if chunks is None:
+                    continue
 
-            language = info.language
-            file_type = classify_file(abs_path, language)
-            chunks = chunk_file(
-                content,
-                file_path_str,
-                language,
-                file_type,
-                config.max_chunk_tokens,
-            )
-            if not chunks:
-                continue
+                chunk_ids = self._metadata.get_chunk_ids(file_path_str)
+                if len(chunks) != len(chunk_ids):
+                    continue
 
-            chunk_ids = self._metadata.get_chunk_ids(file_path_str)
-            if len(chunks) != len(chunk_ids):
-                # Chunk count mismatch — skip to avoid data corruption
-                continue
-
-            self._bm25_store.add_batch(chunk_ids, chunks)
-            rebuilt += 1
+                self._bm25_store.add_batch(chunk_ids, chunks)
+                rebuilt += 1
 
         if rebuilt > 0:
             self._bm25_store.save()
