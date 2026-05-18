@@ -112,19 +112,33 @@ code-rag init /path/to/repo --model minishlab/potion-code-16M
 
 Existing indices remember their model choice via `.code-rag/config.json`.  Re-running `init` without removing `.code-rag/` reuses the persisted model — this is by design so incremental updates don't silently switch models.
 
-> **PowerShell users**: PowerShell expands glob patterns before passing them to `code-rag`, causing `--include` / `--exclude` to malfunction. Use a `.coderagfilter` file in the repo root instead — it is never touched by the shell:
+> **PowerShell users**: PowerShell expands glob patterns (`**`, `*`) against the current directory **before** passing them to `code-rag`. If the target repo contains directories that match the patterns, `--include` / `--exclude` will receive hundreds of expanded file paths instead of the intended glob patterns, breaking the filter logic.
 >
-> ```ini
-> # .coderagfilter
-> [include]
-> Engine/Shaders/**
-> Engine/Sources/**
+> **Workarounds** (pick one):
 >
-> [exclude]
-> Engine/Sources/External/**
-> ```
+> 1. **`--%` stop-parsing token (simplest)** — everything after `--%` is passed literally:
+>    ```powershell
+>    code-rag --% init "D:\Code" --include 'Engine/Shaders/**' --include 'Engine/Sources/**' --exclude 'Engine/Sources/External/**'
+>    ```
+>    Note: `--%` must come **before** the subcommand and arguments.
 >
-> Then run `code-rag init` without any `--include` / `--exclude` flags.
+> 2. **Run from a directory that doesn't contain the named paths** — PowerShell can only expand patterns that match files on disk:
+>    ```powershell
+>    cd C:\ && code-rag init "D:\Code" --include 'Engine/Shaders/**' ...
+>    ```
+>
+> 3. **Use a `.coderagfilter` file** in the repo root — it is never touched by the shell:
+>    ```ini
+>    # .coderagfilter
+>    [include]
+>    Engine/Shaders/**
+>    Engine/Sources/**
+>
+>    [exclude]
+>    Engine/Sources/External/**
+>    Engine/Sources/Compiler/**
+>    ```
+>    Then run `code-rag init` without any `--include` / `--exclude` flags.
 
 ---
 
