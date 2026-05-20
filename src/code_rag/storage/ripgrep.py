@@ -35,6 +35,46 @@ def _has_ripgrep() -> bool:
 
 MAX_FILE_SIZE = 512 * 1024  # 512 KB
 
+# ── Code file extensions for rg glob filtering ────────────────────────
+# When file_list isn't provided, ripgrep is restricted to these extensions
+# so we don't waste time scanning docs, data files, or generated assets.
+_CODE_GLOBS = [
+    "-g",
+    "*.py",
+    "-g",
+    "*.{js,ts,tsx,jsx,mjs,cjs}",
+    "-g",
+    "*.{cpp,cc,cxx,h,hpp,hxx,c}",
+    "-g",
+    "*.java",
+    "-g",
+    "*.cs",
+    "-g",
+    "*.rs",
+    "-g",
+    "*.go",
+    "-g",
+    "*.lua",
+    "-g",
+    "*.{swift,m,mm}",
+    "-g",
+    "*.{kt,kts}",
+    "-g",
+    "*.{rb,rake,gemspec}",
+    "-g",
+    "*.{sh,bash,zsh}",
+    "-g",
+    "*.{sql,psql}",
+    "-g",
+    "*.{proto,cue}",
+    "-g",
+    "*.{cmake,cmake.in}",
+    "-g",
+    "*.{Makefile,GNUmakefile,makefile}",
+    "-g",
+    "*.{Dockerfile,dockerfile}",
+]
+
 
 # ── Public API ───────────────────────────────────────────────────────────
 
@@ -46,7 +86,8 @@ def find_references(
     max_refs: int = 30,
     exclude_file: str | None = None,
     exclude_lines: tuple[int, int] | None = None,
-) -> list[dict]:
+    file_list: list[str] | None = None,
+) -> tuple[list[dict], bool]:
     """Search for textual references to *symbol_name* under *repo_path*.
 
     Tries ripgrep first for performance; falls back to Python if ``rg`` is
@@ -59,10 +100,15 @@ def find_references(
         exclude_file: Relative file path to skip (e.g. the definition file).
         exclude_lines: ``(start, end)`` line range to skip within
             *exclude_file* (the definition itself).
+        file_list: Optional whitelist of relative file paths to scan.
+            When omitted, riprep is restricted to common code extensions
+            (see ``_CODE_GLOBS``).
 
     Returns:
-        List of dicts with ``file_path`` (relative), ``start_line``,
-        ``end_line``, ``text``, ``kind``.
+        ``(refs, timed_out)`` where *refs* is a list of dicts with
+        ``file_path`` (relative), ``start_line``, ``end_line``, ``text``,
+        ``kind``, and *timed_out* is True when the search was cut short by
+        the deadline.
     """
     if _has_ripgrep():
         result = _find_references_rg(
@@ -71,6 +117,7 @@ def find_references(
             max_refs=max_refs,
             exclude_file=exclude_file,
             exclude_lines=exclude_lines,
+            file_list=file_list,
         )
         if result is not None:
             return result
@@ -82,6 +129,7 @@ def find_references(
         max_refs=max_refs,
         exclude_file=exclude_file,
         exclude_lines=exclude_lines,
+        file_list=file_list,
     )
 
 
@@ -95,22 +143,28 @@ def _find_references_rg(
     max_refs: int = 30,
     exclude_file: str | None = None,
     exclude_lines: tuple[int, int] | None = None,
-) -> list[dict] | None:
+    file_list: list[str] | None = None,
+) -> tuple[list[dict], bool] | None:
     """Search via ``rg --json``.  Returns *None* on failure (caller should
-    fall back to Python)."""
+    fall back to Python).  On success returns ``(refs, False)`` (rg never
+    times out internally — its subprocess timeout causes a ``None`` return)."""
     cmd = [
         "rg",
         "--json",
         "-F",  # fixed-string (not regex) — safe for any symbol name
         "--max-filesize",
         f"{MAX_FILE_SIZE}",
-        symbol_name,
-        str(repo_path),
     ]
 
+    # Scope to code extensions when no explicit file list is provided.
+    if file_list is None:
+        cmd.extend(_CODE_GLOBS)
+
+    cmd.extend([symbol_name, str(repo_path)])
+
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    except subprocess.TimeoutExpired, FileNotFoundError, OSError:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return None
 
     # Exit code 1 = no matches (not an error for rg)
@@ -163,7 +217,7 @@ def _find_references_rg(
             }
         )
 
-    return refs
+    return refs, False
 
 
 # ── Python fallback ──────────────────────────────────────────────────────
@@ -177,13 +231,23 @@ def _find_references_python(
     exclude_file: str | None = None,
     exclude_lines: tuple[int, int] | None = None,
     file_list: list[str] | None = None,
+    deadline: float | None = None,
 ) -> list[dict]:
     """Brute-force line-by-line scan.  Used when ``rg`` is unavailable.
 
     If *file_list* is provided, only those files are scanned (relative to
     *repo_path*).  Otherwise walks the directory tree.
+
+    If *deadline* (``time.perf_counter()`` value) is reached, scanning
+    stops early and returns whatever has been collected so far.
     """
+    import time
+
+    if deadline is None:
+        deadline = time.perf_counter() + 15
+
     refs: list[dict] = []
+    timed_out = False
 
     if file_list is not None:
         paths = ((f, repo_path / f) for f in file_list)
@@ -196,6 +260,9 @@ def _find_references_python(
 
     for rel_path, abs_path in paths:
         if len(refs) >= max_refs:
+            break
+        if time.perf_counter() > deadline:
+            timed_out = True
             break
         if not abs_path.exists():
             continue
@@ -227,4 +294,4 @@ def _find_references_python(
             if len(refs) >= max_refs:
                 break
 
-    return refs
+    return refs, timed_out
