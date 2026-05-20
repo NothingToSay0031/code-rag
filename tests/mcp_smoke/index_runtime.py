@@ -43,7 +43,7 @@ def ensure_index(repo_root: Path, force_reindex: bool) -> None:
         "init",
         str(repo_root),
         "--device",
-        "cpu",
+        "auto",
     ]
     run = subprocess.run(
         cmd,
