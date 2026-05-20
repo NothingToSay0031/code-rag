@@ -1045,9 +1045,12 @@ def _symbol_info_all(
                 lines.append("")
                 lines.append(code)
         if include_references:
-            refs = _find_references(idx, s, max_refs=max_refs_per_symbol)
+            refs, timed_out = _find_references(idx, s, max_refs=max_refs_per_symbol)
             if refs:
-                lines.append(f"\nReferences ({len(refs)}):")
+                label = f"\nReferences ({len(refs)})"
+                if timed_out:
+                    label += " — search timed out, results may be incomplete"
+                lines.append(f"{label}:")
                 lines.append(_render_refs(refs))
         count += 1
     lines.append(_SEP)
@@ -1081,9 +1084,12 @@ def _symbol_info_declaration(
                 lines.append("")
                 lines.append(code)
         if include_references:
-            refs = _find_references(idx, s, max_refs=max_refs_per_symbol)
+            refs, timed_out = _find_references(idx, s, max_refs=max_refs_per_symbol)
             if refs:
-                lines.append(f"\nReferences ({len(refs)}):")
+                label = f"\nReferences ({len(refs)})"
+                if timed_out:
+                    label += " — search timed out, results may be incomplete"
+                lines.append(f"{label}:")
                 lines.append(_render_refs(refs))
         count += 1
     lines.append(_SEP)
@@ -1167,11 +1173,14 @@ def _symbol_info_grouped(
                 out_lines.append(code)
 
             if include_references:
-                refs = _find_references(
+                refs, timed_out = _find_references(
                     idx, range_syms[0], max_refs=max_refs_per_symbol
                 )
                 if refs:
-                    out_lines.append(f"\nReferences ({len(refs)}):")
+                    label = f"\nReferences ({len(refs)})"
+                    if timed_out:
+                        label += " — search timed out, results may be incomplete"
+                    out_lines.append(f"{label}:")
                     out_lines.append(_render_refs(refs))
 
             result_count += 1
@@ -1180,7 +1189,7 @@ def _symbol_info_grouped(
     return "\n".join(out_lines) if out_lines else "(no results)"
 
 
-def _find_references(idx: _Index, symbol: SymbolInfo, max_refs: int = 30) -> list[dict]:
+def _find_references(idx: _Index, symbol: SymbolInfo, max_refs: int = 30) -> tuple[list[dict], bool]:
     """Find textual references to *symbol* across the index.
 
     Uses a tiered strategy:
@@ -1189,8 +1198,10 @@ def _find_references(idx: _Index, symbol: SymbolInfo, max_refs: int = 30) -> lis
       unavailable.
 
     Both tiers skip files larger than 512 KB and stop after *max_refs*.
+
+    Returns ``(refs, timed_out)``.
     """
-    refs = _rg_find_references(
+    refs, timed_out = _rg_find_references(
         idx.repo_path,
         symbol.name,
         max_refs=max_refs,
@@ -1238,4 +1249,4 @@ def _find_references(idx: _Index, symbol: SymbolInfo, max_refs: int = 30) -> lis
         file_path = ref.get("file_path")
         if file_path:
             ref["file_path"] = _qualify_path(idx.prefix, file_path)
-    return limited
+    return limited, timed_out
