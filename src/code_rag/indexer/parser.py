@@ -281,11 +281,89 @@ def _find_leftmost_identifier(node, source: bytes) -> str | None:
     return None
 
 
+NAME_NODE_TYPES = IDENTIFIER_NODE_TYPES | {"operator_name"}
+
+
+def _find_rightmost_name(node, source: bytes) -> str | None:
+    """Find the rightmost name in a subtree (identifier or operator_name).
+
+    For C++ qualified names like ``AActor::operator=`` the rightmost
+    component is the actual function name; namespace qualifiers like
+    ``AActor`` must not shadow it.
+    """
+    if node.type in NAME_NODE_TYPES:
+        return get_node_text(node, source)
+    children = list(_iter_cursor_children(node) or ())
+    for child in reversed(children):
+        name = _find_rightmost_name(child, source)
+        if name:
+            return name
+    return None
+
+
+def _extract_c_function_name(decl_node, source: bytes) -> str | None:
+    """Extract function/method name from a C/C++ declarator node.
+
+    The ``declarator`` field of a ``function_definition`` can be wrapped by
+    ``reference_declarator`` / ``pointer_declarator`` (e.g. when returning
+    by reference).  Drill through those to find the ``function_declarator``,
+    then extract the name from its inner declarator (the qualifier part),
+    falling back to operator_name if no regular identifier is found.
+    """
+    # Drill through wrapper declarators to find the function_declarator
+    func_decl = decl_node
+    while func_decl is not None and func_decl.type not in (
+        "function_declarator",
+        "array_declarator",
+        "field_identifier",
+        "qualified_identifier",
+        "identifier",
+        "template_function",
+        "operator_name",
+    ):
+        func_decl = func_decl.child_by_field_name("declarator") or next(
+            (c for c in func_decl.children if c.type == "function_declarator"), None
+        ) or func_decl
+
+    if func_decl is None:
+        return None
+
+    # Get the pure name part (qualified_identifier / field_identifier)
+    if func_decl.type == "function_declarator":
+        name_part = func_decl.child_by_field_name("declarator")
+    else:
+        name_part = func_decl
+
+    if name_part is None:
+        return None
+
+    name = _find_rightmost_name(name_part, source)
+    if name is not None:
+        return name
+    return _extract_operator_name(name_part, source)
+
+
+def _extract_operator_name(decl_node, source: bytes) -> str | None:
+    """Extract operator name (e.g. ``operator=``) from a declarator node.
+
+    tree-sitter-cpp represents ``operator=`` as an ``operator_name`` node
+    whose text spans the full ``operator=`` keyword+symbol sequence.
+    """
+    for child in _iter_cursor_children(decl_node) or ():
+        if child.type == "operator_name":
+            return get_node_text(child, source)
+        # Recurse into nested declarators / qualified identifiers
+        name = _extract_operator_name(child, source)
+        if name is not None:
+            return name
+    return None
+
+
 def _extract_name(node, source: bytes, config: LanguageConfig) -> str | None:
     name_node = node.child_by_field_name(config.name_field)
     if name_node is not None:
         if config.name_field == "declarator":
-            return _find_leftmost_identifier(name_node, source)
+            return _extract_c_function_name(name_node, source)
         return get_node_text(name_node, source)
 
     for fallback_field in ("type", "name", "declarator"):
@@ -293,7 +371,9 @@ def _extract_name(node, source: bytes, config: LanguageConfig) -> str | None:
         if fallback_node is None:
             continue
         if fallback_field == "declarator":
-            name = _find_leftmost_identifier(fallback_node, source)
+            name = _extract_c_function_name(fallback_node, source)
+            if name:
+                return name
         else:
             name = get_node_text(fallback_node, source)
         if name:
