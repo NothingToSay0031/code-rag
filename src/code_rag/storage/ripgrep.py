@@ -35,45 +35,49 @@ def _has_ripgrep() -> bool:
 
 MAX_FILE_SIZE = 512 * 1024  # 512 KB
 
-# ── Code file extensions for rg glob filtering ────────────────────────
-# When file_list isn't provided, ripgrep is restricted to these extensions
-# so we don't waste time scanning docs, data files, or generated assets.
-_CODE_GLOBS = [
-    "-g",
-    "*.py",
-    "-g",
-    "*.{js,ts,tsx,jsx,mjs,cjs}",
-    "-g",
-    "*.{cpp,cc,cxx,h,hpp,hxx,c}",
-    "-g",
-    "*.java",
-    "-g",
-    "*.cs",
-    "-g",
-    "*.rs",
-    "-g",
-    "*.go",
-    "-g",
-    "*.lua",
-    "-g",
-    "*.{swift,m,mm}",
-    "-g",
-    "*.{kt,kts}",
-    "-g",
-    "*.{rb,rake,gemspec}",
-    "-g",
-    "*.{sh,bash,zsh}",
-    "-g",
-    "*.{sql,psql}",
-    "-g",
-    "*.{proto,cue}",
-    "-g",
-    "*.{cmake,cmake.in}",
-    "-g",
-    "*.{Makefile,GNUmakefile,makefile}",
-    "-g",
-    "*.{Dockerfile,dockerfile}",
-]
+# ── Code file extensions for Python fallback filtering ──────────────────
+# When file_list isn't provided and rg is unavailable, the Python fallback
+# only scans files with these suffixes.  Matches the _EXT_LANGUAGE_MAP in
+# server.py so post-search filtering stays cheap.
+_CODE_EXTENSIONS = frozenset(
+    {
+        ".py",
+        ".js",
+        ".ts",
+        ".tsx",
+        ".jsx",
+        ".mjs",
+        ".cjs",
+        ".cpp",
+        ".cc",
+        ".cxx",
+        ".c",
+        ".h",
+        ".hpp",
+        ".hxx",
+        ".java",
+        ".cs",
+        ".rs",
+        ".go",
+        ".lua",
+        ".swift",
+        ".m",
+        ".mm",
+        ".kt",
+        ".kts",
+        ".rb",
+        ".rake",
+        ".gemspec",
+        ".sh",
+        ".bash",
+        ".zsh",
+        ".sql",
+        ".psql",
+        ".proto",
+        ".cue",
+        ".cmake",
+    }
+)
 
 
 # ── Public API ───────────────────────────────────────────────────────────
@@ -101,8 +105,9 @@ def find_references(
         exclude_lines: ``(start, end)`` line range to skip within
             *exclude_file* (the definition itself).
         file_list: Optional whitelist of relative file paths to scan.
-            When omitted, riprep is restricted to common code extensions
-            (see ``_CODE_GLOBS``).
+            When omitted, ripgrep searches all files (respects ``.gitignore``)
+            and the Python fallback restricts to code extensions
+            (see ``_CODE_EXTENSIONS``).
 
     Returns:
         ``(refs, timed_out)`` where *refs* is a list of dicts with
@@ -154,13 +159,9 @@ def _find_references_rg(
         "-F",  # fixed-string (not regex) — safe for any symbol name
         "--max-filesize",
         f"{MAX_FILE_SIZE}",
+        symbol_name,
+        str(repo_path),
     ]
-
-    # Scope to code extensions when no explicit file list is provided.
-    if file_list is None:
-        cmd.extend(_CODE_GLOBS)
-
-    cmd.extend([symbol_name, str(repo_path)])
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
@@ -232,11 +233,12 @@ def _find_references_python(
     exclude_lines: tuple[int, int] | None = None,
     file_list: list[str] | None = None,
     deadline: float | None = None,
-) -> list[dict]:
+) -> tuple[list[dict], bool]:
     """Brute-force line-by-line scan.  Used when ``rg`` is unavailable.
 
     If *file_list* is provided, only those files are scanned (relative to
-    *repo_path*).  Otherwise walks the directory tree.
+    *repo_path*).  Otherwise walks the directory tree, restricted to code
+    file extensions (see ``_CODE_EXTENSIONS``).
 
     If *deadline* (``time.perf_counter()`` value) is reached, scanning
     stops early and returns whatever has been collected so far.
@@ -255,7 +257,7 @@ def _find_references_python(
         paths = (
             (str(p.relative_to(repo_path).as_posix()), p)
             for p in repo_path.rglob("*")
-            if p.is_file()
+            if p.is_file() and p.suffix.lower() in _CODE_EXTENSIONS
         )
 
     for rel_path, abs_path in paths:

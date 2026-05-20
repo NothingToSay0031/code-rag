@@ -1046,12 +1046,13 @@ def _symbol_info_all(
                 lines.append(code)
         if include_references:
             refs, timed_out = _find_references(idx, s, max_refs=max_refs_per_symbol)
-            if refs:
+            if refs or timed_out:
                 label = f"\nReferences ({len(refs)})"
                 if timed_out:
                     label += " — search timed out, results may be incomplete"
                 lines.append(f"{label}:")
-                lines.append(_render_refs(refs))
+                if refs:
+                    lines.append(_render_refs(refs))
         count += 1
     lines.append(_SEP)
     return "\n".join(lines) if lines else "(no results)"
@@ -1085,12 +1086,13 @@ def _symbol_info_declaration(
                 lines.append(code)
         if include_references:
             refs, timed_out = _find_references(idx, s, max_refs=max_refs_per_symbol)
-            if refs:
+            if refs or timed_out:
                 label = f"\nReferences ({len(refs)})"
                 if timed_out:
                     label += " — search timed out, results may be incomplete"
                 lines.append(f"{label}:")
-                lines.append(_render_refs(refs))
+                if refs:
+                    lines.append(_render_refs(refs))
         count += 1
     lines.append(_SEP)
     return "\n".join(lines) if lines else "(no results)"
@@ -1176,12 +1178,13 @@ def _symbol_info_grouped(
                 refs, timed_out = _find_references(
                     idx, range_syms[0], max_refs=max_refs_per_symbol
                 )
-                if refs:
+                if refs or timed_out:
                     label = f"\nReferences ({len(refs)})"
                     if timed_out:
                         label += " — search timed out, results may be incomplete"
                     out_lines.append(f"{label}:")
-                    out_lines.append(_render_refs(refs))
+                    if refs:
+                        out_lines.append(_render_refs(refs))
 
             result_count += 1
 
