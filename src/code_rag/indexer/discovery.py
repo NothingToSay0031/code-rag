@@ -243,7 +243,6 @@ def discover_files(repo_path: Path, config: CodeRagConfig) -> list[Path]:
         is_code = file_lang in _CODE_LANGUAGES
 
         if size > _MAX_FILE_SIZE and not is_code:
-            print(f"Warning: skipping large non-code file ({size} bytes): {rel}")
             return False
 
         # Binary detection (empty files pass through)

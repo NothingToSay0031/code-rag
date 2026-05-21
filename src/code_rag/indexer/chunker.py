@@ -125,11 +125,13 @@ def chunk_file(
     language: str | None,
     chunk_type: str,
     max_tokens: int = 512,
+    source_bytes: bytes | None = None,
+    ast_nodes: list | None = None,
 ) -> list[Chunk]:
     if not source.strip():
         return []
     if chunk_type == "code" and language:
-        return chunk_code(source, file_path, language, max_tokens)
+        return chunk_code(source, file_path, language, max_tokens, source_bytes, ast_nodes)
     elif chunk_type == "doc":
         return chunk_docs(source, file_path, max_tokens)
     elif chunk_type == "config":
@@ -138,30 +140,38 @@ def chunk_file(
 
 
 def chunk_code(
-    source: str, file_path: str, language: str, max_tokens: int
+    source: str,
+    file_path: str,
+    language: str,
+    max_tokens: int,
+    source_bytes: bytes | None = None,
+    ast_nodes: list | None = None,
 ) -> list[Chunk]:
-    source_bytes = source.encode("utf-8")
-    try:
-        tree = parse_file(source_bytes, language)
-        nodes = get_ast_children(tree, source_bytes, language)
-    except Exception:
-        # Parser failed — fall back to sliding window so we respect max_tokens
-        # rather than dumping the entire (potentially huge) file as one chunk.
-        windows = sliding_window_split(source, max_tokens)
-        return [
-            Chunk(
-                text=w,
-                file_path=file_path,
-                start_line=1,
-                end_line=source.count("\n") + 1,
-                chunk_type="code",
-                language=language,
-                symbol_name=None,
-                symbol_kind=None,
-                metadata={"window": i} if len(windows) > 1 else {},
-            )
-            for i, w in enumerate(windows)
-        ]
+    if source_bytes is not None and ast_nodes is not None:
+        nodes = ast_nodes
+    else:
+        source_bytes = source.encode("utf-8")  # type: ignore[assignment]
+        try:
+            tree = parse_file(source_bytes, language)
+            nodes = get_ast_children(tree, source_bytes, language)
+        except Exception:
+            # Parser failed — fall back to sliding window so we respect max_tokens
+            # rather than dumping the entire (potentially huge) file as one chunk.
+            windows = sliding_window_split(source, max_tokens)
+            return [
+                Chunk(
+                    text=w,
+                    file_path=file_path,
+                    start_line=1,
+                    end_line=source.count("\n") + 1,
+                    chunk_type="code",
+                    language=language,
+                    symbol_name=None,
+                    symbol_kind=None,
+                    metadata={"window": i} if len(windows) > 1 else {},
+                )
+                for i, w in enumerate(windows)
+            ]
 
     if not nodes:
         # No top-level AST nodes — apply sliding window instead of returning
@@ -212,7 +222,8 @@ def _chunk_ast_node(
 
     # If it fits, return as single chunk
     doc = f"# {node.doc_comment}\n" if node.doc_comment else ""
-    if count_tokens(doc + full_text) <= max_tokens:
+    combined = doc + full_text
+    if count_tokens(combined) <= max_tokens:
         # Count extra lines prepended before the actual file content so that
         # _build_snippet can map code_lines[i] → file line (start_line + i)
         # correctly.  chunk.text = doc + context_prefix + node_text, so the
@@ -221,7 +232,7 @@ def _chunk_ast_node(
         metadata: dict = {"header_lines": header_lines} if header_lines else {}
         return [
             Chunk(
-                text=doc + full_text,
+                text=combined,
                 file_path=file_path,
                 start_line=start_line,
                 end_line=end_line,
@@ -236,7 +247,7 @@ def _chunk_ast_node(
     # If node has children, recurse with context prefix
     if node.children:
         # Build context: first line of parent
-        first_line = node_text.split("\n")[0]
+        first_line = node_text[:node_text.find("\n")] if "\n" in node_text else node_text
         child_prefix = context_prefix + first_line + "\n"
         child_chunks = []
         for child in node.children:

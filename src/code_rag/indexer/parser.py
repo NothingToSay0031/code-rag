@@ -228,16 +228,6 @@ def get_node_text(node, source: bytes) -> str:
     return source[node.start_byte : node.end_byte].decode("utf-8")
 
 
-def _iter_cursor_children(node):
-    cursor = node.walk()
-    if not cursor.goto_first_child():
-        return
-    while True:
-        yield cursor.node
-        if not cursor.goto_next_sibling():
-            break
-
-
 def _build_kind_lookup(config: LanguageConfig) -> dict[str, list[str]]:
     lookup: dict[str, list[str]] = {}
     for kind, node_types in config.node_types.items():
@@ -247,9 +237,8 @@ def _build_kind_lookup(config: LanguageConfig) -> dict[str, list[str]]:
 
 
 def _resolve_symbol_kind(
-    node, parent_ast: ASTNode | None, config: LanguageConfig
+    node, parent_ast: ASTNode | None, kind_lookup: dict[str, list[str]], config: LanguageConfig
 ) -> str | None:
-    kind_lookup = _build_kind_lookup(config)
     candidates = kind_lookup.get(node.type)
     if not candidates:
         return None
@@ -274,7 +263,7 @@ def _resolve_symbol_kind(
 def _find_leftmost_identifier(node, source: bytes) -> str | None:
     if node.type in IDENTIFIER_NODE_TYPES:
         return get_node_text(node, source)
-    for child in _iter_cursor_children(node) or ():
+    for child in node.children:
         identifier = _find_leftmost_identifier(child, source)
         if identifier:
             return identifier
@@ -293,8 +282,7 @@ def _find_rightmost_name(node, source: bytes) -> str | None:
     """
     if node.type in NAME_NODE_TYPES:
         return get_node_text(node, source)
-    children = list(_iter_cursor_children(node) or ())
-    for child in reversed(children):
+    for child in reversed(node.children):
         name = _find_rightmost_name(child, source)
         if name:
             return name
@@ -323,7 +311,7 @@ def _extract_c_function_name(decl_node, source: bytes) -> str | None:
     ):
         func_decl = func_decl.child_by_field_name("declarator") or next(
             (c for c in func_decl.children if c.type == "function_declarator"), None
-        ) or func_decl
+        )
 
     if func_decl is None:
         return None
@@ -349,7 +337,7 @@ def _extract_operator_name(decl_node, source: bytes) -> str | None:
     tree-sitter-cpp represents ``operator=`` as an ``operator_name`` node
     whose text spans the full ``operator=`` keyword+symbol sequence.
     """
-    for child in _iter_cursor_children(decl_node) or ():
+    for child in decl_node.children:
         if child.type == "operator_name":
             return get_node_text(child, source)
         # Recurse into nested declarators / qualified identifiers
@@ -379,7 +367,7 @@ def _extract_name(node, source: bytes, config: LanguageConfig) -> str | None:
         if name:
             return name
 
-    for child in _iter_cursor_children(node) or ():
+    for child in node.children:
         if child.type == "type_spec":
             type_name = child.child_by_field_name("name")
             if type_name is not None:
@@ -422,7 +410,7 @@ def _comment_text(node, source: bytes, config: LanguageConfig) -> str | None:
         return get_node_text(node, source).strip()
     if node.type in config.doc_types:
         first_named_child = next(
-            (child for child in (_iter_cursor_children(node) or ()) if child.is_named),
+            (child for child in node.children if child.is_named),
             None,
         )
         if first_named_child is None or first_named_child.type != "string":
@@ -459,7 +447,7 @@ def _extract_python_inner_doc(
         body = node.child_by_field_name(field_name)
         if body is None:
             continue
-        for child in _iter_cursor_children(body) or ():
+        for child in body.children:
             if not child.is_named:
                 continue
             text = _comment_text(child, source, config)
@@ -481,12 +469,13 @@ def _extract_doc_comment(node, source: bytes, config: LanguageConfig) -> str | N
 def get_ast_children(tree: Tree, source: bytes, language: str) -> list[ASTNode]:
     resolved_language = _normalize_language(language)
     config = LANGUAGE_CONFIGS[resolved_language]
+    kind_lookup = _build_kind_lookup(config)
     root = tree.root_node
     ast_roots: list[ASTNode] = []
 
     def visit(node, parent_ast: ASTNode | None) -> None:
         current_parent = parent_ast
-        kind = _resolve_symbol_kind(node, parent_ast, config)
+        kind = _resolve_symbol_kind(node, parent_ast, kind_lookup, config)
         if kind is not None and _should_include_symbol(node, kind):
             name = _extract_name(node, source, config)
             if name:
@@ -513,7 +502,7 @@ def get_ast_children(tree: Tree, source: bytes, language: str) -> list[ASTNode]:
                 else:
                     parent_ast.children.append(current_parent)
 
-        for child in _iter_cursor_children(node) or ():
+        for child in node.children:
             visit(child, current_parent)
 
     visit(root, None)
