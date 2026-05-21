@@ -176,17 +176,14 @@ class Embedder:
         print(f"Loading {self._model_name} on {self._resolved_device}...")
         from sentence_transformers import SentenceTransformer
 
-        kwargs: dict = {}
-        if "qwen3" in self._model_name.lower():
-            # Qwen3 is a decoder (left-to-right) model; left-padding is required
-            # so that the last real token is always at position [-1].
-            kwargs["processor_kwargs"] = {"padding_side": "left"}
-
         self._model = SentenceTransformer(
             self._model_name,
             device=self._resolved_device,
-            **kwargs,
         )
+        # Qwen3 is a decoder (left-to-right) model; left-padding is required
+        # so that the last real token is always at position [-1].
+        if "qwen3" in self._model_name.lower():
+            self._model.tokenizer.padding_side = "left"
         # Cap the model's input length to match the chunking budget so that
         # embeddings cover the full chunk text without silent truncation.
         # Falls back to 512 for BGE models when no explicit limit is given.
@@ -343,7 +340,6 @@ class Embedder:
         # Re-using this avoids a CUDA context sync per mini-batch.
         # It is refreshed after any OOM event inside _encode_with_retry.
         free_gb = self._get_free_vram_gb()
-        free_gb_no_flush = self._get_free_vram_gb(flush_cache=False)
 
         min_len = lengths[sorted_idx[0]]
         max_len = lengths[sorted_idx[-1]]
@@ -351,8 +347,7 @@ class Embedder:
         bs_long = self._compute_batch_size_for_seq_len(max_len, free_gb)
         print(
             f"  Token lengths: min={min_len}, max={max_len} | "
-            f"batch_size: {bs_long} (long) → {bs_short} (short) | "
-            f"free VRAM: {free_gb_no_flush:.1f} GB (after flush: {free_gb:.1f} GB)"
+            f"batch_size: {bs_long} (long) → {bs_short} (short)"
         )
 
         all_embeddings: list[np.ndarray | None] = [None] * len(texts)
@@ -371,13 +366,7 @@ class Embedder:
                 _refresh_interval = 15 if sys.platform == "win32" else 50
                 if groups_done % _refresh_interval == 0:
                     gc.collect()
-                    free_gb_no_flush = self._get_free_vram_gb(flush_cache=False)
                     free_gb = self._get_free_vram_gb()
-                    # pbar.write(
-                    #     f"  [VRAM refresh @ group {groups_done}] "
-                    #     f"free: {free_gb_no_flush:.1f} GB "
-                    #     f"(after flush: {free_gb:.1f} GB)"
-                    # )
 
                 group_min_len = lengths[sorted_idx[pos]]
 

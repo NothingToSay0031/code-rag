@@ -4,7 +4,7 @@ import gc
 import os
 import threading
 import time
-from concurrent.futures import as_completed, ThreadPoolExecutor
+from concurrent.futures import as_completed, FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePath
 from queue import Queue
@@ -21,7 +21,7 @@ from code_rag.indexer.discovery import (
     get_file_fingerprint,
 )
 from code_rag.indexer.embedder import Embedder
-from code_rag.indexer.parser import extract_symbols, parse_file
+from code_rag.indexer.parser import get_ast_children, parse_file
 from code_rag.models import FileInfo
 from code_rag.storage.bm25_store import BM25Store
 from code_rag.storage.metadata import MetadataStore
@@ -92,18 +92,33 @@ def _parse_and_chunk_file(
         )
 
     symbols = []
+    _ast_nodes: list = []
+    _source_bytes: bytes | None = None
     if file_type == "code" and language:
-        try:
-            source_bytes = content.encode("utf-8")
-            tree = parse_file(source_bytes, language)
-            symbols = extract_symbols(tree, source_bytes, language)
-            for symbol in symbols:
-                symbol.file_path = file_path_str
-        except Exception:
-            symbols = []
+        _source_bytes = content.encode("utf-8")
+        # Files over 1MB can take 30-120+ seconds in tree-sitter and are
+        # typically auto-generated or shader code where AST structure is less
+        # useful.  Fall back to sliding-window chunking instead.
+        if len(_source_bytes) <= 1_000_000:
+            try:
+                tree = parse_file(_source_bytes, language)
+                _ast_nodes = get_ast_children(tree, _source_bytes, language)
+                # Extract symbols from AST nodes (single walk)
+                _work = list(_ast_nodes)
+                while _work:
+                    node = _work.pop()
+                    if node.symbol is not None:
+                        node.symbol.file_path = file_path_str
+                        symbols.append(node.symbol)
+                    _work.extend(node.children)
+            except Exception:
+                symbols = []
+                _ast_nodes = []
 
     chunks = chunk_file(
-        content, file_path_str, language, file_type, max_chunk_tokens
+        content, file_path_str, language, file_type, max_chunk_tokens,
+        source_bytes=_source_bytes,
+        ast_nodes=_ast_nodes if _ast_nodes else None,
     )
 
     if not chunks:
@@ -310,7 +325,20 @@ class IndexPipeline:
         # Using daemon threads so that if one gets stuck in tree-sitter C code
         # the process can still exit.  Results flow back through a thread-safe
         # queue and the main thread collects them with a per-file timeout.
-        work_items = list(files_to_process)
+
+        # Sort by file size (smallest first) so threads process quick files
+        # first and large files are naturally spread across threads at the end.
+        # This keeps the progress bar moving and reduces the chance that all
+        # threads simultaneously hit a multi-megabyte file.
+        _sized: list[tuple[str, int]] = []
+        for fp in files_to_process:
+            try:
+                sz = (config.repo_path / fp).stat().st_size
+            except OSError:
+                sz = 0
+            _sized.append((fp, sz))
+        _sized.sort(key=lambda x: x[1])
+        work_items: list[str] = [fp for fp, _ in _sized]
         work_lock = threading.Lock()
         work_idx = 0
         result_queue: Queue[_FileProcessResult | None] = Queue()
@@ -341,15 +369,21 @@ class IndexPipeline:
             t.start()
 
         PARALLEL_TIMEOUT = 120
+        SHORT_POLL = 5  # check for stall every N seconds
         collected = 0
         total = len(files_to_process)
+        last_progress = time.time()
         pbar = tqdm(total=total, desc="Parsing & chunking", unit="file")
 
         while collected < total:
             try:
-                result = result_queue.get(timeout=PARALLEL_TIMEOUT)
+                result = result_queue.get(timeout=SHORT_POLL)
             except Exception:  # queue.Empty
-                break
+                if time.time() - last_progress > PARALLEL_TIMEOUT:
+                    break
+                continue
+
+            last_progress = time.time()
 
             if result is None:
                 continue
@@ -380,51 +414,69 @@ class IndexPipeline:
 
         # -- Retry stuck files with per-file timeout -------------------------------
         # Tree-sitter can hang on certain files (large generated C, shaders).
-        # Process each file in a daemon thread with a per-file timeout so a
-        # single stuck file doesn't block the entire retry.
+        # Use ThreadPoolExecutor so slow files don't serialize the retry.
         if stuck:
             PER_FILE_TIMEOUT = 30
             skipped_timeout = 0
             print(
                 f"\n{len(stuck)} file(s) timed out in parallel parse. "
-                f"Retrying single-threaded (per-file timeout={PER_FILE_TIMEOUT}s)..."
+                f"Retrying with {max_workers} threads (per-file timeout={PER_FILE_TIMEOUT}s)..."
             )
-            pbar2 = tqdm(stuck, desc="Parsing (retry)", unit="file")
-            for file_path_str in pbar2:
-                q: Queue[_FileProcessResult | None] = Queue()
+            pbar2 = tqdm(total=len(stuck), desc="Parsing (retry)", unit="file")
 
-                def _worker(fp: str = file_path_str) -> None:
-                    r = _parse_and_chunk_file(
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                future_to_path = {}
+                for fp in stuck:
+                    future = pool.submit(
+                        _parse_and_chunk_file,
                         fp,
                         config.repo_path,
                         current_fingerprints[fp],
                         config.custom_type_mappings,
                         config.max_chunk_tokens,
                     )
-                    q.put(r)
+                    future_to_path[future] = fp
 
-                t = threading.Thread(target=_worker, daemon=True)
-                t.start()
-                try:
-                    result = q.get(timeout=PER_FILE_TIMEOUT)
-                except Exception:
-                    skipped_timeout += 1
-                    continue
+                pending = set(future_to_path.keys())
+                while pending:
+                    done, pending = wait(
+                        pending,
+                        timeout=PER_FILE_TIMEOUT,
+                        return_when=FIRST_COMPLETED,
+                    )
 
-                if result.status == "error":
-                    self._metadata.remove_file(result.file_path_str)
-                elif result.status in ("unknown", "no_chunks"):
-                    self._metadata.set_file_info(
-                        result.file_path_str, result.file_info
-                    )
-                elif result.status == "success":
-                    all_file_chunks[result.file_path_str] = result.chunks
-                    self._metadata.set_file_info(
-                        result.file_path_str, result.file_info
-                    )
-                    self._metadata.set_symbols(
-                        result.file_path_str, result.symbols
-                    )
+                    if not done:
+                        skipped_timeout += len(pending)
+                        for f in pending:
+                            f.cancel()
+                        pbar2.update(len(pending))
+                        break
+
+                    for future in done:
+                        try:
+                            result = future.result()
+                        except Exception:
+                            skipped_timeout += 1
+                            pbar2.update(1)
+                            continue
+
+                        if result.status == "error":
+                            self._metadata.remove_file(result.file_path_str)
+                        elif result.status in ("unknown", "no_chunks"):
+                            self._metadata.set_file_info(
+                                result.file_path_str, result.file_info
+                            )
+                        elif result.status == "success":
+                            all_file_chunks[result.file_path_str] = result.chunks
+                            self._metadata.set_file_info(
+                                result.file_path_str, result.file_info
+                            )
+                            self._metadata.set_symbols(
+                                result.file_path_str, result.symbols
+                            )
+
+                        pbar2.update(1)
+
             pbar2.close()
             if skipped_timeout:
                 print(
