@@ -167,7 +167,16 @@ class Embedder:
             device="cpu",
             backend="onnx",
         )
-        self._model.max_seq_length = self._max_seq_length or 512
+        # Cap at the model's actual position embedding limit (see
+        # _load_sentence_transformers for the full rationale).
+        from transformers import AutoConfig
+
+        config = AutoConfig.from_pretrained(self._model_name)
+        model_max = getattr(config, "max_position_embeddings", None) or getattr(
+            config, "n_positions", None
+        ) or 512
+        requested = self._max_seq_length or model_max
+        self._model.max_seq_length = min(requested, model_max)
         self._backend = "onnx"
         print(f"Model loaded (ONNX). Dimension: {self.dimension}")
 
@@ -184,10 +193,16 @@ class Embedder:
         # so that the last real token is always at position [-1].
         if "qwen3" in self._model_name.lower():
             self._model.tokenizer.padding_side = "left"
-        # Cap the model's input length to match the chunking budget so that
-        # embeddings cover the full chunk text without silent truncation.
-        # Falls back to 512 for BGE models when no explicit limit is given.
-        self._model.max_seq_length = self._max_seq_length or 512
+        # Honour the caller's max_seq_length BUT never exceed what the
+        # underlying transformer can actually handle (e.g. BERT's 512
+        # position embeddings).  config.max_chunk_tokens is 4096 for
+        # chunking; the embedder must cap it to the model's real limit
+        # or the forward pass will crash with a tensor-size mismatch.
+        model_max = getattr(
+            self._model[0].auto_model.config, "max_position_embeddings", None
+        ) or getattr(self._model[0].auto_model.config, "n_positions", None) or 512
+        requested = self._max_seq_length or model_max
+        self._model.max_seq_length = min(requested, model_max)
         self._backend = "sentence_transformers"
         print(f"Model loaded (torch). Dimension: {self.dimension}")
 
