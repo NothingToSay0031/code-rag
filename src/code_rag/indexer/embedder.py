@@ -41,8 +41,8 @@ QWEN3_QUERY_INSTRUCTION = (
 
 class Embedder:
     """Embedding engine with dual runtime paths:
-    - CPU: ONNX Runtime + bge-small (fast, lightweight)
-    - GPU: sentence-transformers + torch + bge-large (high quality)
+    - CPU: ONNX Runtime + sentence-transformers (fast, lightweight)
+    - GPU: sentence-transformers + torch (high throughput)
     """
 
     def __init__(
@@ -88,13 +88,6 @@ class Embedder:
                 self._resolved_device = "cpu"
         else:
             self._resolved_device = self._device
-        # Auto-upgrade model for GPU
-        if (
-            self._resolved_device == "cuda"
-            and self._model_name == "BAAI/bge-small-en-v1.5"
-        ):
-            self._model_name = "BAAI/bge-large-en-v1.5"
-
     def _is_static(self) -> bool:
         """Return True if the model is a static embedding model (model2vec)."""
         name = self._model_name.lower()
@@ -251,8 +244,12 @@ class Embedder:
         this quadratic factor relative to a 512-token baseline and keep a
         safety buffer for allocator overhead and fragmentation.
         """
-        if self._resolved_device != "cuda" or free_gb <= 0:
-            return 64 if self._resolved_device != "cuda" else 8
+        if self._resolved_device != "cuda":
+            return 64
+        if free_gb <= 0:
+            # VRAM query failed (e.g. corrupted CUDA context).  We're flying
+            # blind — be maximally conservative so we don't make things worse.
+            return 1
 
         dim = self.dimension
         # Empirical baseline at 512 tokens.

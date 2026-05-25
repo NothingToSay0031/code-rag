@@ -562,46 +562,60 @@ class IndexPipeline:
                         [chunk.text for chunk in batch_chunks]
                     )
                 except Exception as exc:
-                    # On transient CUDA errors (e.g. cudaErrorUnknown,
-                    # AcceleratorError) the embed_passages retry logic may
-                    # have already exhausted its per-group retries.  Before
-                    # giving up on the entire batch, try one more time with
-                    # a full GPU reset — these errors are often transient
-                    # (WDDM TDR, driver hiccup) and a fresh attempt succeeds.
                     from code_rag.indexer.embedder import Embedder
 
                     if Embedder._is_cuda_error(exc):
+                        oom = "out of memory" in str(exc).lower()
                         print(
                             f"\n!!! CUDA error at batch {batch_num}: "
                             f"{type(exc).__name__}: {exc}"
                         )
-                        print("Attempting GPU reset + retry for entire batch...")
-                        gc.collect()
-                        try:
-                            import torch
-
-                            if torch.cuda.is_available():
-                                try:
-                                    torch.cuda.empty_cache()
-                                except Exception:
-                                    pass
-                                try:
-                                    torch.cuda.synchronize()
-                                except RuntimeError:
-                                    pass
-                        except ImportError:
-                            pass
-                        try:
-                            embeddings = self._embedder.embed_passages(
-                                [chunk.text for chunk in batch_chunks]
-                            )
-                        except Exception as retry_exc:
-                            # Retry also failed — checkpoint and exit.
+                        if oom:
+                            # OOM: the exception unwind freed Python-side refs,
+                            # so a retry with freed CUDA cache may succeed.
+                            print("Attempting GPU reset + retry for entire batch...")
+                            gc.collect()
+                            try:
+                                import torch
+                                if torch.cuda.is_available():
+                                    try:
+                                        torch.cuda.empty_cache()
+                                    except Exception:
+                                        pass
+                                    try:
+                                        torch.cuda.synchronize()
+                                    except RuntimeError:
+                                        pass
+                            except ImportError:
+                                pass
+                            try:
+                                embeddings = self._embedder.embed_passages(
+                                    [chunk.text for chunk in batch_chunks]
+                                )
+                            except Exception as retry_exc:
+                                print(
+                                    f"\n!!! Retry also failed: "
+                                    f"{type(retry_exc).__name__}: {retry_exc}"
+                                )
+                                print("Saving checkpoint before exit...")
+                                self._bm25_store.save()
+                                self._metadata.save()
+                                print(
+                                    f"Checkpoint saved. "
+                                    f"{chunks_created} chunks embedded so far. "
+                                    f"Re-run to resume from batch {batch_num}."
+                                )
+                                raise
+                        else:
+                            # Non-OOM CUDA error (e.g. cudaErrorUnknown / TDR):
+                            # the CUDA context is permanently corrupted for
+                            # this process — retrying won't help.  Checkpoint
+                            # and let the user re-run to get a fresh context.
                             print(
-                                f"\n!!! Retry also failed: "
-                                f"{type(retry_exc).__name__}: {retry_exc}"
+                                "CUDA context appears unrecoverable "
+                                "(driver timeout / TDR). "
+                                "Saving checkpoint — re-run to resume."
                             )
-                            print("Saving checkpoint before exit...")
                             self._bm25_store.save()
                             self._metadata.save()
                             print(
