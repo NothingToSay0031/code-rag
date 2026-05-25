@@ -49,9 +49,10 @@ class CodeRagConfig:
             return "cpu"
 
     def resolve_model_name(self) -> str:
-        device = self.resolve_device()
-        if self.model_name == "BAAI/bge-small-en-v1.5" and device == "cuda":
-            return "BAAI/bge-large-en-v1.5"
+        # TODO: re-enable after small-vs-large GPU benchmark
+        # device = self.resolve_device()
+        # if self.model_name == "BAAI/bge-small-en-v1.5" and device == "cuda":
+        #     return "BAAI/bge-large-en-v1.5"
         return self.model_name
 
     # ------------------------------------------------------------------
