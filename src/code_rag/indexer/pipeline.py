@@ -192,6 +192,15 @@ class IndexPipeline:
             config.resolve_device(),
             max_seq_length=config.max_chunk_tokens,
         )
+        # Chunk size must respect the model's actual position-embedding cap.
+        # For example, BGE models cap at 512 tokens regardless of config;
+        # chunking larger than the embedder limit silently discards tokens.
+        self._chunk_tokens = self._embedder.effective_max_seq_length
+        if self._chunk_tokens != config.max_chunk_tokens:
+            print(
+                f"Chunk size capped to {self._chunk_tokens} tokens "
+                f"(model limit, was {config.max_chunk_tokens} in config)"
+            )
         # Set the real tokenizer for accurate token counting in chunker
         set_tokenizer(self._embedder.tokenizer)
         self._vector_store = VectorStore(self._vector_db_path, self._embedder.dimension)
@@ -357,7 +366,7 @@ class IndexPipeline:
                     config.repo_path,
                     current_fingerprints[file_path_str],
                     config.custom_type_mappings,
-                    config.max_chunk_tokens,
+                    self._chunk_tokens,
                 )
                 result_queue.put(result)
 
@@ -433,7 +442,7 @@ class IndexPipeline:
                         config.repo_path,
                         current_fingerprints[fp],
                         config.custom_type_mappings,
-                        config.max_chunk_tokens,
+                        self._chunk_tokens,
                     )
                     future_to_path[future] = fp
 
@@ -741,7 +750,7 @@ class IndexPipeline:
                         file_path_str,
                         config.repo_path,
                         info.language,
-                        config.max_chunk_tokens,
+                        self._chunk_tokens,
                     )
                 ] = file_path_str
 

@@ -579,3 +579,29 @@ class Embedder:
         if self._model is not None and self._is_static():
             return self._model.dim
         return MODEL_CONFIGS.get(self._model_name, 384)
+
+    @property
+    def effective_max_seq_length(self) -> int:
+        """The actual max token length the model will use for encoding.
+
+        This is ``min(requested, model_max_position_embeddings)`` — the same
+        cap applied in :meth:`_load_sentence_transformers` and
+        :meth:`_load_onnx`.  Reads the HuggingFace config to determine the
+        model limit without loading weights, so it is safe to call early.
+
+        Returns the *requested* value unchanged for static (model2vec) models
+        that have no position-embedding cap.
+        """
+        requested = self._max_seq_length
+        if self._is_static():
+            return requested or 512  # model2vec has no length cap
+
+        from transformers import AutoConfig
+
+        config = AutoConfig.from_pretrained(self._model_name)
+        model_max = getattr(config, "max_position_embeddings", None) or getattr(
+            config, "n_positions", None
+        ) or 512
+        if requested is None:
+            return model_max
+        return min(requested, model_max)
