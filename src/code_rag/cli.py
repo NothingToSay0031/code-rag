@@ -220,6 +220,18 @@ def _load_last_repo() -> str | None:
     return None
 
 
+def _load_existing_model(repo: Path) -> str | None:
+    """Return the model_name from an existing ``.code-rag/config.json``, if any."""
+    config_file = repo / ".code-rag" / "config.json"
+    if config_file.exists():
+        try:
+            data = json.loads(config_file.read_text(encoding="utf-8"))
+            return data.get("model_name")
+        except Exception:
+            pass
+    return None
+
+
 @click.group(invoke_without_command=True)
 @click.version_option(version="0.1.0")
 @click.option(
@@ -274,14 +286,22 @@ def init(
     from code_rag.config import CodeRagConfig
     from code_rag.indexer.pipeline import IndexPipeline
 
+    repo = Path(repo_path)
     kwargs: dict = dict(
-        repo_path=Path(repo_path),
+        repo_path=repo,
         device=device,
         include_patterns=[p.replace("\\", "/") for p in include_patterns],
         exclude_patterns=[p.replace("\\", "/") for p in exclude_patterns],
     )
+
     if model_name:
         kwargs["model_name"] = model_name
+    else:
+        # Reuse the model from an existing index so re-indexing does not
+        # silently switch the embedding model (and produce dimension mismatches).
+        existing = _load_existing_model(repo)
+        if existing:
+            kwargs["model_name"] = existing
 
     config = CodeRagConfig(**kwargs)
 
