@@ -536,19 +536,21 @@ def search_code(
     index_name: str | None = None,
     exclude_paths: list[str] | None = None,
 ) -> str:
-    """Semantic + BM25 hybrid code search. Use for concept/behavior queries when the exact symbol name is unknown. If you already know the identifier, use get_symbol_info instead.
+    """Hybrid (semantic + BM25) code search. Find code by what it does.
 
-    Token‑heavy (top_k results). Read all results before calling again; use read_code to expand truncated snippets; use offset to paginate.
+    Query must be a **keyword-dense short phrase** — NOT a sentence or question.
+    Include domain terms (subsystem, API, algorithm).  Examples:
+      "PhysX contact modify collision filter"     (good — terse, technical)
+      "how does rendering work"                   (bad — filler words)
 
-    Snippet size scales with top_k. Oversized chunks show per-symbol previews (▸ kind name L#). Use read_code to expand any result.
+    If you already know the exact identifier, use get_symbol_info instead.
 
     Args:
-        query: Concept/behavior description, not an exact identifier.
-        top_k: Results to return (default 8). Lower top_k → more lines per result. Max useful value is 15.
+        query: Keyword-dense short phrase. No questions or filler words.
+        top_k: Results to return (default 8). Lower = more lines per result.
         offset: Skip N results for pagination (default 0).
-        language: Language filter. Omit for cross-language queries (e.g. C++ bindings, FFI, codegen).
-        index_name: Multi-index only. See list_indices().
-        exclude_paths: Path substrings to exclude. Default excludes "Test". Pass [] to disable.
+        language: Language filter (e.g. "cpp", "python"). Omit for all.
+        exclude_paths: Path substrings to exclude. Default excludes "Test".
     """
     state = _get_state()
     indices = state["indices"]
@@ -588,16 +590,15 @@ def search_docs(
     index_name: str | None = None,
     exclude_paths: list[str] | None = None,
 ) -> str:
-    """Semantic + BM25 search over Markdown, RST, and text documentation files.
+    """Hybrid search over Markdown, RST, and text documentation files.
 
-    Snippet size scales with top_k: ≤3→200 ln, ≤5→150, ≤10→100, >10→80-100. Oversized sections are truncated with a read_code hint. Use offset to paginate.
+    Same query style as search_code: keyword-dense short phrase, not a sentence.
 
     Args:
-        query: Search query.
-        top_k: Number of results (default 8). Lower top_k → more lines per result.
+        query: Keyword-dense short phrase.
+        top_k: Number of results (default 8). Lower = more lines per result.
         offset: Skip N results for pagination (default 0).
-        index_name: Multi-index only. See list_indices().
-        exclude_paths: Path substrings to exclude. Default excludes "Test". Pass [] to disable.
+        exclude_paths: Path substrings to exclude. Default excludes "Test".
     """
     state = _get_state()
     indices = state["indices"]
@@ -872,25 +873,14 @@ def get_symbol_info(
     max_refs_per_symbol: int = 30,
     index_name: str | None = None,
 ) -> str:
-    """Look up symbol definitions and references from the AST index. Use when you know the exact identifier name. For concept/behavior queries, use search_code instead.
+    """Look up symbol definitions and references from the AST index.
 
-    symbol_name must be the literal identifier as it appears in source code — not a description.
-
-    Common patterns:
-      get_symbol_info("LoadResource")                                           # definition only
-      get_symbol_info("LoadResource", include_code=True)                       # + source
-      get_symbol_info("LoadResource", include_references=True)                 # + all call sites
-      get_symbol_info("LoadResource", include_code=True, include_references=True)  # full picture
+    Use when you know the exact identifier name. For concept queries, use search_code.
 
     Args:
-        symbol_name: Exact identifier as in source code (e.g. "LoadResource"). Case-insensitive.
-        mode: "grouped" (default) merges adjacent symbols per file; "declaration" returns only class/struct/enum/interface; "all" returns every match individually.
-        max_results: Max entries (default 20). In grouped mode, counts file groups.
-        exact_match: True (default) for exact name match. False for substring matching.
-        include_code: Include source code of each symbol (default False). Use read_code for on-demand fetching.
-        include_references: Find all call sites/usages via ripgrep (default False). Replaces a second search_code call for the same name.
-        max_refs_per_symbol: Max references per symbol (default 30). Only when include_references=True.
-        index_name: Omit to search all indices. See list_indices().
+        symbol_name: Exact identifier (case-insensitive), e.g. "LoadResource".
+        include_code: Include source code (default False). Use read_code for on-demand.
+        include_references: Find all call sites via ripgrep (default False).
     """
     state = _get_state()
     indices = state["indices"]
