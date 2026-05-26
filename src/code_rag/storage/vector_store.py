@@ -91,6 +91,13 @@ class VectorStore:
         for i, chunk in enumerate(chunks):
             chunk_id = base_id + i
             ids.append(str(chunk_id))
+            if len(chunk.text) > 65535:
+                import warnings
+
+                warnings.warn(
+                    f"Chunk text truncated from {len(chunk.text)} to 65535 chars "
+                    f"(file={chunk.file_path}, lines {chunk.start_line}-{chunk.end_line})"
+                )
             documents.append(chunk.text[:65535])
             metadatas.append(
                 {

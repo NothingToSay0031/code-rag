@@ -206,10 +206,7 @@ class BM25Store:
         tmp_path = self._store_path.with_suffix(".pkl.tmp")
         with open(tmp_path, "wb") as f:
             pickle.dump(data, f)
-        # Atomic rename (overwrites existing on POSIX; Windows needs remove first)
-        if os.name == "nt" and self._store_path.exists():
-            self._store_path.unlink()
-        tmp_path.rename(self._store_path)
+        os.replace(tmp_path, self._store_path)
 
     def _load(self):
         try:

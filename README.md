@@ -80,34 +80,39 @@ This runs `git pull` in the detected code-rag repository root (a checkout that c
 
 ### Model selection
 
-| Model | Dims | Speed | Quality | GPU | RAM |
-|-------|------|-------|---------|-----|-----|
-| **`Qwen/Qwen3-Embedding-0.6B`** (default) | 1024 | ★☆☆ | ★★★ | CUDA recommended | ~2 GB |
-| `Qwen/Qwen3-Embedding-4B` | 2560 | ★☆☆ | ★★★ | CUDA required | ~8 GB |
-| `Qwen/Qwen3-Embedding-8B` | 4096 | ★☆☆ | ★★★ | CUDA required | ~16 GB |
-| `BAAI/bge-large-en-v1.5` | 1024 | ★★☆ | ★★☆ | Auto-detect | ~1.3 GB |
-| `minishlab/potion-code-16M` | 256 | ★★★ | ★☆☆ | Not needed | ~100 MB |
+Two recommended models — pick based on your priorities:
 
-**Qwen3** models are decoder-transformers that produce high-quality embeddings, especially for cross-language and complex semantic queries. The 0.6B variant is the default — it fits on most consumer GPUs and delivers strong retrieval accuracy on large repositories. 4B and 8B variants need workstation/server cards. CPU inference is prohibitively slow for all Qwen3 models; CUDA is strongly recommended.
+| Model | Dims | Strength | GPU |
+|-------|------|----------|-----|
+| **`BAAI/bge-small-en-v1.5`** (default) | 384 | Best retrieval quality | Auto-detect |
+| `Qwen/Qwen3-Embedding-0.6B` | 1024 | Fastest indexing | CUDA recommended |
 
-**potion-code-16M** is a static embedding model (~16M params, 256-dim) that runs entirely on CPU without a GPU. It is orders of magnitude faster than transformer-based models — a 20K-file codebase indexes in ~15 minutes instead of ~4 hours — but retrieval accuracy is significantly lower on large repositories. Only recommended when no GPU is available.
+Other supported models are available but not generally recommended:
+
+| Model | Dims | Notes |
+|-------|------|-------|
+| `Qwen/Qwen3-Embedding-4B` | 2560 | Much heavier, marginal quality gain over 0.6B |
+| `Qwen/Qwen3-Embedding-8B` | 4096 | Workstation/server cards only |
+| `BAAI/bge-large-en-v1.5` | 1024 | Heavier than bge-small, no practical benefit |
+| `minishlab/potion-code-16M` | 256 | CPU-only, very fast but low retrieval quality |
+
+**BGE-small** is the default — it runs on CPU or GPU and consistently delivers the best retrieval accuracy on code repositories.
+
+**Qwen3-0.6B** is a decoder-transformer that indexes significantly faster on GPU, while maintaining strong retrieval quality. CUDA recommended; CPU inference is impractically slow.
 
 **Switching models** per index:
 
 ```bash
-# Default: high-quality GPU indexing
+# Default: best retrieval quality (CPU or GPU)
 code-rag init /path/to/repo
 
-# Fast CPU indexing (lower quality, no GPU needed)
-code-rag init /path/to/repo --model minishlab/potion-code-16M
-
-# Larger Qwen3 variants for even higher quality
-code-rag init /path/to/repo --model Qwen/Qwen3-Embedding-4B
+# Faster GPU indexing
+code-rag init /path/to/repo --model Qwen/Qwen3-Embedding-0.6B
 
 # Re-index an existing repo with a different model
 # (remove .code-rag/ first, or the old model's config will be reused)
 rm -rf /path/to/repo/.code-rag
-code-rag init /path/to/repo --model minishlab/potion-code-16M
+code-rag init /path/to/repo --model Qwen/Qwen3-Embedding-0.6B
 ```
 
 Existing indices remember their model choice via `.code-rag/config.json`.  Re-running `init` without removing `.code-rag/` reuses the persisted model — this is by design so incremental updates don't silently switch models.
@@ -190,4 +195,4 @@ Python, JavaScript, TypeScript, C, C++, Java, C#, Rust, Go, Lua — plus documen
 
 - Python 3.14+
 - ~500 MB disk per indexed repo (vectors + BM25 index)
-- RAM: ~2 GB with default Qwen3-0.6B (GPU); ~100 MB with potion model (CPU)
+- RAM: ~500 MB with default bge-small (CPU/GPU); ~2 GB with Qwen3-0.6B (GPU)

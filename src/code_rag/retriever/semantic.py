@@ -22,9 +22,9 @@ class SemanticRetriever:
         # Build filter expression
         filters = []
         if language:
-            filters.append(f'language == "{language}"')
+            filters.append(f'language == "{language.replace(chr(34), chr(34)+chr(34))}"')
         if chunk_type:
-            filters.append(f'chunk_type == "{chunk_type}"')
+            filters.append(f'chunk_type == "{chunk_type.replace(chr(34), chr(34)+chr(34))}"')
         filter_expr = " and ".join(filters) if filters else None
 
         results = self._vector_store.search(

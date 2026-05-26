@@ -151,10 +151,7 @@ class MetadataStore:
         }
         tmp_path = self._store_path.with_suffix(".json.tmp")
         tmp_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        # Atomic rename
-        if os.name == "nt" and self._store_path.exists():
-            self._store_path.unlink()
-        tmp_path.rename(self._store_path)
+        os.replace(tmp_path, self._store_path)
 
     def _load(self):
         data = json.loads(self._store_path.read_text(encoding="utf-8"))

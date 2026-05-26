@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import os
 import sys
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -65,6 +66,7 @@ class _Index:
 # ---------------------------------------------------------------------------
 
 _state: dict = {}
+_state_lock = threading.Lock()
 
 
 def _find_sub_indices(root: Path) -> list[Path]:
@@ -115,8 +117,9 @@ def _build_index(repo_path: Path, prefix: str) -> _Index:
 
 
 def _get_state() -> dict:
-    if _state:
-        return _state
+    with _state_lock:
+        if _state:
+            return _state
 
     root = Path(os.environ.get("CODE_RAG_REPO", ".")).resolve()
     data_dir = root / ".code-rag"
@@ -148,12 +151,13 @@ def _get_state() -> dict:
         info = [f"{idx.prefix}({idx.config.resolve_model_name()})" for idx in indices]
         print(f"[CodeRAG] Multi-index ({len(indices)} repos): {info}", file=sys.stderr)
 
-    _state.update(
-        {
-            "root": root,
-            "indices": indices,
-        }
-    )
+    with _state_lock:
+        _state.update(
+            {
+                "root": root,
+                "indices": indices,
+            }
+        )
     return _state
 
 

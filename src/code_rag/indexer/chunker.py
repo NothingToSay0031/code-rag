@@ -4,6 +4,7 @@ from typing import Any
 
 from code_rag.models import Chunk
 from code_rag.indexer.parser import parse_file, get_ast_children, ASTNode
+import re
 
 # ---------------------------------------------------------------------------
 # Tokenizer-aware token counting
@@ -229,7 +230,9 @@ def _chunk_ast_node(
         # correctly.  chunk.text = doc + context_prefix + node_text, so the
         # file content starts at line index (doc + context_prefix).count("\n").
         header_lines = (doc + context_prefix).count("\n")
-        metadata: dict = {"header_lines": header_lines} if header_lines else {}
+        metadata: dict = {"token_count": count_tokens(combined)}
+        if header_lines:
+            metadata["header_lines"] = header_lines
         return [
             Chunk(
                 text=combined,
@@ -271,11 +274,13 @@ def _chunk_ast_node(
             language=language,
             symbol_name=symbol_name,
             symbol_kind=symbol_kind,
-            metadata={"window": i},
+            metadata={"window": i, "token_count": count_tokens(w)},
         )
         for i, w in enumerate(windows)
     ]
 
+
+_HEADING_RE = re.compile(r"^#{1,6}\s")
 
 def chunk_docs(source: str, file_path: str, max_tokens: int) -> list[Chunk]:
     sections = []
@@ -284,7 +289,7 @@ def chunk_docs(source: str, file_path: str, max_tokens: int) -> list[Chunk]:
     current_heading_level = 0
 
     for i, line in enumerate(source.split("\n"), 1):
-        if line.startswith("#") and current_lines:
+        if _HEADING_RE.match(line) and current_lines:
             sections.append(
                 (current_start, i - 1, "\n".join(current_lines), current_heading_level)
             )
@@ -293,7 +298,7 @@ def chunk_docs(source: str, file_path: str, max_tokens: int) -> list[Chunk]:
             # Count heading level (number of leading #)
             current_heading_level = len(line) - len(line.lstrip("#"))
         else:
-            if line.startswith("#") and not current_lines:
+            if _HEADING_RE.match(line) and not current_lines:
                 current_heading_level = len(line) - len(line.lstrip("#"))
             current_lines.append(line)
 
@@ -312,6 +317,7 @@ def chunk_docs(source: str, file_path: str, max_tokens: int) -> list[Chunk]:
         if not text.strip():
             continue
         meta = {"heading_level": heading_level} if heading_level else {}
+        meta["token_count"] = count_tokens(text)
         if count_tokens(text) <= max_tokens:
             chunks.append(
                 Chunk(
@@ -338,7 +344,7 @@ def chunk_docs(source: str, file_path: str, max_tokens: int) -> list[Chunk]:
                         language=None,
                         symbol_name=None,
                         symbol_kind=None,
-                        metadata={**meta, "window": j},
+                        metadata={**meta, "window": j, "token_count": count_tokens(w)},
                     )
                 )
     return chunks

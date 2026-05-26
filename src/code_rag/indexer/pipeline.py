@@ -503,8 +503,11 @@ class IndexPipeline:
 
         # == Phase 2: Embed in batches with checkpoints ========================
         # Static models (model2vec) have no VRAM pressure — checkpoint I/O is
-        # pure overhead.  Build a single batch so we only persist at the end.
-        if self._embedder._is_static():
+        # pure overhead, so build a single batch and only persist at the end.
+        # Small models (dim ≤ 384, e.g. BGE-small) are also fast enough that
+        # I/O overhead dominates, so raise the threshold to reduce checkpoint
+        # frequency (~fewer, larger batches).
+        if self._embedder.is_static:
             checkpoint_every = max(checkpoint_every, total_chunks + 1)
 
         # Batch by chunk count (not file count) for uniform batch sizes.
@@ -568,11 +571,10 @@ class IndexPipeline:
 
                 try:
                     embeddings = self._embedder.embed_passages(
-                        [chunk.text for chunk in batch_chunks]
+                        [chunk.text for chunk in batch_chunks],
+                        lengths=[chunk.metadata.get("token_count") for chunk in batch_chunks],
                     )
                 except Exception as exc:
-                    from code_rag.indexer.embedder import Embedder
-
                     if Embedder._is_cuda_error(exc):
                         oom = "out of memory" in str(exc).lower()
                         print(

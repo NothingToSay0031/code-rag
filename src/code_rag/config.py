@@ -15,7 +15,7 @@ class FilterConfig:
 class CodeRagConfig:
     repo_path: Path
     data_dir: str = ".code-rag"
-    model_name: str = "Qwen/Qwen3-Embedding-0.6B"
+    model_name: str = "BAAI/bge-small-en-v1.5"
     device: str = "auto"
     max_chunk_tokens: int = 4096
     custom_type_mappings: dict[str, str] = field(
@@ -89,7 +89,7 @@ class CodeRagConfig:
                 data = json.loads(config_file.read_text(encoding="utf-8"))
                 return cls(
                     repo_path=repo_path,
-                    model_name=data.get("model_name", "Qwen/Qwen3-Embedding-0.6B"),
+                    model_name=data.get("model_name", "BAAI/bge-small-en-v1.5"),
                     device=data.get("device", "auto"),
                 )
             except Exception:

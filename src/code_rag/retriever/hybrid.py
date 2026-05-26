@@ -132,8 +132,8 @@ class HybridRetriever:
         """
         excl = _resolve_exclude(exclude_paths)
         fetch_k = top_k * (_FILTER_OVERFETCH if excl else 2)
-        # Disable filtering inside search(); apply here in a single pass.
-        results = self.search(query, top_k=fetch_k, language=language, exclude_paths=[])
+        # All filtering applied here in a single pass; disable inside search().
+        results = self.search(query, top_k=fetch_k, language=None, exclude_paths=[])
         filtered = [
             r
             for r in results

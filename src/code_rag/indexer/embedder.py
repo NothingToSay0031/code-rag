@@ -56,6 +56,7 @@ class Embedder:
         self._max_seq_length = max_seq_length
         self._model = None  # LAZY LOADING
         self._resolved_device: str | None = None
+        self._cached_max_seq: int | None = None
         self._backend: str | None = None  # "onnx" or "sentence_transformers"
         self._tokenizer_obj = None  # Lazy-loaded tokenizer (lightweight, no model)
 
@@ -92,6 +93,11 @@ class Embedder:
         """Return True if the model is a static embedding model (model2vec)."""
         name = self._model_name.lower()
         return "potion" in name or "model2vec" in name
+
+    @property
+    def is_static(self) -> bool:
+        """Public accessor for static-model check."""
+        return self._is_static()
 
     @property
     def tokenizer(self):
@@ -293,7 +299,7 @@ class Embedder:
             return len(self._tokenizer_obj.encode(text, add_special_tokens=False))
         return max(1, len(text.split()))
 
-    def embed_passages(self, texts: list[str]) -> np.ndarray:
+    def embed_passages(self, texts: list[str], lengths: list[int] | None = None) -> np.ndarray:
         """Embed passages with length-aware batching to prevent VRAM overflow.
 
         Standard ``model.encode()`` uses one fixed batch size for the entire
@@ -342,7 +348,8 @@ class Embedder:
             )
 
         # --- GPU path: length-aware batching --------------------------------
-        lengths = [self._count_tokens_fast(t) for t in texts]
+        if lengths is None or None in lengths:
+            lengths = [self._count_tokens_fast(t) for t in texts]
 
         # Sort ascending: short sequences → large batches first (fast wins),
         # long sequences → small but safe batches later.
@@ -578,6 +585,18 @@ class Embedder:
         # Prefer the loaded model's actual dimension when available
         if self._model is not None and self._is_static():
             return self._model.dim
+        # Try to read the real hidden size from the model config before falling
+        # back to the hard-coded dict.  This prevents silent dimension mismatches
+        # (e.g. 768-dim model creating a 384-dim vector store).
+        try:
+            from transformers import AutoConfig
+
+            config = AutoConfig.from_pretrained(self._model_name)
+            dim = getattr(config, "hidden_size", None) or getattr(config, "d_model", None)
+            if dim is not None:
+                return dim
+        except Exception:
+            pass
         return MODEL_CONFIGS.get(self._model_name, 384)
 
     @property
@@ -592,9 +611,12 @@ class Embedder:
         Returns the *requested* value unchanged for static (model2vec) models
         that have no position-embedding cap.
         """
+        if self._cached_max_seq is not None:
+            return self._cached_max_seq
         requested = self._max_seq_length
         if self._is_static():
-            return requested or 512  # model2vec has no length cap
+            self._cached_max_seq = requested or 512
+            return self._cached_max_seq
 
         from transformers import AutoConfig
 
@@ -602,6 +624,6 @@ class Embedder:
         model_max = getattr(config, "max_position_embeddings", None) or getattr(
             config, "n_positions", None
         ) or 512
-        if requested is None:
-            return model_max
-        return min(requested, model_max)
+        result = model_max if requested is None else min(requested, model_max)
+        self._cached_max_seq = result
+        return result
