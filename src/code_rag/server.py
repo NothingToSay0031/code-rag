@@ -113,52 +113,55 @@ def _build_index(repo_path: Path, prefix: str) -> _Index:
         vector_store=vector_store,
         bm25_store=bm25_store,
         browse_db=browse_db,
+        _path_case_map={f.lower(): f for f in metadata.get_all_files()},
     )
 
 
 def _get_state() -> dict:
     with _state_lock:
-        if _state:
+        if _state and not _state.get("_initializing"):
             return _state
+        _state["_initializing"] = True
+        try:
+            root = Path(os.environ.get("CODE_RAG_REPO", ".")).resolve()
+            data_dir = root / ".code-rag"
 
-    root = Path(os.environ.get("CODE_RAG_REPO", ".")).resolve()
-    data_dir = root / ".code-rag"
+            indices: list[_Index] = []
 
-    indices: list[_Index] = []
+            if data_dir.exists():
+                # Single-index: CWD itself is an indexed repo
+                indices.append(_build_index(root, prefix=""))
+                idx = indices[0]
+                print(
+                    f"[CodeRAG] Single index: {root}  model={idx.config.resolve_model_name()}",
+                    file=sys.stderr,
+                )
+            else:
+                # Multi-index: scan subdirectories
+                sub_repos = _find_sub_indices(root)
+                if not sub_repos:
+                    raise RuntimeError(
+                        f"No indexed repositories found under {root}.\n"
+                        f"Run 'code-rag init <repo_path>' first."
+                    )
+                for repo_path in sub_repos:
+                    try:
+                        prefix = repo_path.relative_to(root).as_posix()
+                    except ValueError:
+                        prefix = repo_path.name
+                    indices.append(_build_index(repo_path, prefix=prefix))
+                info = [f"{idx.prefix}({idx.config.resolve_model_name()})" for idx in indices]
+                print(f"[CodeRAG] Multi-index ({len(indices)} repos): {info}", file=sys.stderr)
 
-    if data_dir.exists():
-        # Single-index: CWD itself is an indexed repo
-        indices.append(_build_index(root, prefix=""))
-        idx = indices[0]
-        print(
-            f"[CodeRAG] Single index: {root}  model={idx.config.resolve_model_name()}",
-            file=sys.stderr,
-        )
-    else:
-        # Multi-index: scan subdirectories
-        sub_repos = _find_sub_indices(root)
-        if not sub_repos:
-            raise RuntimeError(
-                f"No indexed repositories found under {root}.\n"
-                f"Run 'code-rag init <repo_path>' first."
+            _state.update(
+                {
+                    "root": root,
+                    "indices": indices,
+                }
             )
-        for repo_path in sub_repos:
-            try:
-                prefix = repo_path.relative_to(root).as_posix()
-            except ValueError:
-                prefix = repo_path.name
-            indices.append(_build_index(repo_path, prefix=prefix))
-        info = [f"{idx.prefix}({idx.config.resolve_model_name()})" for idx in indices]
-        print(f"[CodeRAG] Multi-index ({len(indices)} repos): {info}", file=sys.stderr)
-
-    with _state_lock:
-        _state.update(
-            {
-                "root": root,
-                "indices": indices,
-            }
-        )
-    return _state
+        finally:
+            _state.pop("_initializing", None)
+        return _state
 
 
 # ---------------------------------------------------------------------------
@@ -230,9 +233,21 @@ def _normalize_cpp_path(idx: "_Index", abs_path_str: str) -> str:
     if not rel:
         return rel
 
-    if idx._path_case_map is None:
-        idx._path_case_map = {f.lower(): f for f in idx.metadata.get_all_files()}
-    return idx._path_case_map.get(rel.lower(), rel)
+    result = idx._path_case_map.get(rel.lower())
+    if result is not None:
+        return result
+    # Fallback: case-insensitive filesystem lookup
+    # NOTE: skip candidate.exists() because on case-insensitive filesystems
+    # (Windows/macOS) it returns True even for wrong case, so the directory
+    # scan below would never run.
+    candidate = idx.repo_path / rel
+    parent = candidate.parent
+    if parent.exists():
+        target_lower = candidate.name.lower()
+        for child in parent.iterdir():
+            if child.name.lower() == target_lower:
+                return child.relative_to(idx.repo_path).as_posix()
+    return rel
 
 
 def _resolve_file(
@@ -331,6 +346,12 @@ def read_code(
     state = _get_state()
     indices = state["indices"]
 
+    if start_line < 1 or end_line < 1:
+        return f"error: start_line and end_line must be >= 1 (got {start_line}, {end_line})"
+
+    if start_line > end_line:
+        return f"error: start_line ({start_line}) must be <= end_line ({end_line})"
+
     resolved = _resolve_file(indices, file_path)
     if resolved is None:
         return f"error: File not found: {file_path}"
@@ -417,18 +438,19 @@ def _render_results(
         lang = entry.get("language") or ""
         sym = entry.get("symbol_name") or ""
         meta = (
-            f"[{rank}]  {entry['file_path']}"
-            f"  L{entry['start_line']}–{entry['end_line']}"
+            f"[{rank}]  {entry.get('file_path', '(unknown)')}"
+            f"  L{entry.get('start_line', '?')}–{entry.get('end_line', '?')}"
         )
         if lang:
             meta += f"  {lang}"
-        meta += f"  score={entry['score']}"
+        score = entry.get("score", "?")
+        meta += f"  score={score}"
         if sym:
             meta += f"  symbol={sym}"
         lines.append(_SEP)
         lines.append(meta)
         lines.append("")
-        lines.append(entry["snippet"])
+        lines.append(entry.get("snippet", ""))
     lines.append(_SEP)
     return "\n".join(lines)
 
@@ -452,7 +474,8 @@ def _build_snippet(
     # chunk.text = doc_comment_prefix + context_prefix + node_source_text.
     # The first header_lines lines are NOT real file lines at start_line; they
     # are prepended metadata.  Skip them so line-number labels are accurate.
-    header_lines = r.chunk.metadata.get("header_lines", 0)
+    metadata = r.chunk.metadata if isinstance(r.chunk.metadata, dict) else {}
+    header_lines = metadata.get("header_lines", 0)
     content_lines = code_lines[
         header_lines:
     ]  # Actual file lines starting at start_line
@@ -476,13 +499,13 @@ def _build_snippet(
             key=lambda s: s.start_line,
         )
         if not chunk_syms:
-            # No symbol metadata: first 30 lines + hint.
-            visible = content_lines[:30]
+            # No symbol metadata: first snippet_full_limit lines + hint.
+            visible = content_lines[:snippet_full_limit]
             snippet = "\n".join(
                 f"{r.chunk.start_line + i}: {line}" for i, line in enumerate(visible)
             )
             snippet += (
-                f"\n... ({total_lines - 30} more lines"
+                f"\n... ({total_lines - snippet_full_limit} more lines"
                 f" — use read_code({r.chunk.start_line},"
                 f" {r.chunk.end_line}) for full content)"
             )
@@ -565,6 +588,8 @@ def search_code(
         query, top_k=top_k + offset, language=language, exclude_paths=exclude_paths
     )
     results = results[offset : offset + top_k]
+    if offset > 0 and not results:
+        return f"Offset {offset} exceeds available results."
 
     output = [
         {
@@ -574,7 +599,7 @@ def search_code(
             "language": r.chunk.language,
             "symbol_name": r.chunk.symbol_name,
             "score": round(r.score, 4),
-            "snippet": _build_snippet(r, idx, top_k, rank),
+            "snippet": _build_snippet(r, idx, top_k, offset + rank + 1),
         }
         for rank, r in enumerate(results)
     ]
@@ -613,6 +638,8 @@ def search_docs(
         query, top_k=top_k + offset, exclude_paths=exclude_paths
     )
     results = results[offset : offset + top_k]
+    if offset > 0 and not results:
+        return f"Offset {offset} exceeds available results."
 
     output = [
         {
@@ -620,7 +647,7 @@ def search_docs(
             "start_line": r.chunk.start_line,
             "end_line": r.chunk.end_line,
             "score": round(r.score, 4),
-            "snippet": _build_snippet(r, idx, top_k, rank),
+            "snippet": _build_snippet(r, idx, top_k, offset + rank + 1),
         }
         for rank, r in enumerate(results)
     ]
@@ -897,6 +924,7 @@ def get_symbol_info(
     # Tier 1: Fall back to MetadataStore (always available)
     raw_symbols: list[tuple[_Index, SymbolInfo]] = []
     browse_db_extras: dict | None = None  # inheritance info from Browse.VC.db
+    browse_seen: set[tuple[str, str, int]] = set()  # dedup: (file_path_lower, name_lower, start_line)
 
     for idx in indices:
         # ── Tier 0: Browse.VC.db ──
@@ -920,6 +948,9 @@ def get_symbol_info(
                             ),
                         )
                     )
+                    browse_seen.add(
+                        (rel_path.lower(), item["name"].lower(), item["start_line"])
+                    )
                 # Collect inheritance info for class/struct symbols
                 class_items = [i for i in db_results if i["kind_id"] in (1, 2, 5)]
                 if class_items:
@@ -933,10 +964,12 @@ def get_symbol_info(
                             browse_db_extras["derived_classes"] = [
                                 d["name"] for d in derived
                             ]
-                continue  # Skip MetadataStore if Browse.VC.db had results
 
         # ── Tier 1: MetadataStore ──
         for s in idx.metadata.find_symbol(symbol_name, exact_only=exact_match):
+            key = (s.file_path.lower(), s.name.lower(), s.start_line)
+            if key in browse_seen:
+                continue
             raw_symbols.append((idx, s))
 
     if mode == "declaration":
@@ -1048,7 +1081,8 @@ def _symbol_info_all(
                 if refs:
                     lines.append(_render_refs(refs))
         count += 1
-    lines.append(_SEP)
+    if lines:
+        lines.append(_SEP)
     return "\n".join(lines) if lines else "(no results)"
 
 
@@ -1088,7 +1122,8 @@ def _symbol_info_declaration(
                 if refs:
                     lines.append(_render_refs(refs))
         count += 1
-    lines.append(_SEP)
+    if lines:
+        lines.append(_SEP)
     return "\n".join(lines) if lines else "(no results)"
 
 
@@ -1182,7 +1217,8 @@ def _symbol_info_grouped(
 
             result_count += 1
 
-    out_lines.append(_SEP)
+    if out_lines:
+        out_lines.append(_SEP)
     return "\n".join(out_lines) if out_lines else "(no results)"
 
 

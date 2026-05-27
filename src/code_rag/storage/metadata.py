@@ -1,5 +1,7 @@
 import json
 import os
+import threading
+import time
 from pathlib import Path
 from code_rag.models import FileInfo, SymbolInfo
 
@@ -11,6 +13,7 @@ def _normalize_path(file_path: str) -> str:
 class MetadataStore:
     def __init__(self, store_path: Path):
         self._store_path = store_path
+        self._lock = threading.Lock()
         self._files: dict[str, FileInfo] = {}
         self._symbols: dict[str, list[SymbolInfo]] = {}  # file_path → symbols
         self._chunk_map: dict[str, list[int]] = {}  # file_path → chunk IDs
@@ -20,9 +23,10 @@ class MetadataStore:
             self._load()
 
     def set_file_info(self, file_path: str, info: FileInfo):
-        file_path = _normalize_path(file_path)
-        info.path = _normalize_path(info.path)
-        self._files[file_path] = info
+        with self._lock:
+            file_path = _normalize_path(file_path)
+            info.path = _normalize_path(info.path)
+            self._files[file_path] = info
 
     def get_file_info(self, file_path: str) -> FileInfo | None:
         return self._files.get(_normalize_path(file_path))
@@ -32,26 +36,27 @@ class MetadataStore:
         return info.sha256 if info else None
 
     def set_symbols(self, file_path: str, symbols: list[SymbolInfo]):
-        file_path = _normalize_path(file_path)
-        # Remove old entries from name index
-        old = self._symbols.get(file_path, [])
-        for sym in old:
-            key = sym.name.lower()
-            bucket = self._name_index.get(key)
-            if bucket is not None:
-                try:
-                    bucket.remove(sym)
-                except ValueError:
-                    pass
-                if not bucket:
-                    del self._name_index[key]
-        # Store new symbols
-        for sym in symbols:
-            sym.file_path = _normalize_path(sym.file_path) if sym.file_path else file_path
-        self._symbols[file_path] = symbols
-        # Add to name index
-        for sym in symbols:
-            self._name_index.setdefault(sym.name.lower(), []).append(sym)
+        with self._lock:
+            file_path = _normalize_path(file_path)
+            # Remove old entries from name index
+            old = self._symbols.get(file_path, [])
+            for sym in old:
+                key = sym.name.lower()
+                bucket = self._name_index.get(key)
+                if bucket is not None:
+                    try:
+                        bucket.remove(sym)
+                    except ValueError:
+                        pass
+                    if not bucket:
+                        del self._name_index[key]
+            # Store new symbols
+            for sym in symbols:
+                sym.file_path = _normalize_path(sym.file_path) if sym.file_path else file_path
+            self._symbols[file_path] = symbols
+            # Add to name index
+            for sym in symbols:
+                self._name_index.setdefault(sym.name.lower(), []).append(sym)
 
     def get_symbols(self, file_path: str) -> list[SymbolInfo]:
         return self._symbols.get(_normalize_path(file_path), [])
@@ -71,50 +76,53 @@ class MetadataStore:
             exact_only: When True, only return exact name matches (case-insensitive).
                         Skips the O(N) substring scan entirely.
         """
-        query = symbol_name.lower()
+        with self._lock:
+            query = symbol_name.lower()
 
-        # O(1) exact match via inverted index
-        exact = list(self._name_index.get(query, []))
+            # O(1) exact match via inverted index
+            exact = list(self._name_index.get(query, []))
 
-        if exact_only or len(exact) >= limit:
-            return exact[:limit]
+            if exact_only or len(exact) >= limit:
+                return exact[:limit]
 
-        # O(N) substring scan for partial matches (skip exact dupes)
-        remaining = limit - len(exact)
-        exact_set = set(id(s) for s in exact)
-        partial: list[SymbolInfo] = []
-        for symbols in self._symbols.values():
-            for sym in symbols:
-                if id(sym) in exact_set:
-                    continue
-                if query in sym.name.lower():
-                    partial.append(sym)
-                    if len(partial) >= remaining:
-                        return exact + partial
-        return exact + partial
+            # O(N) substring scan for partial matches (skip exact dupes)
+            remaining = limit - len(exact)
+            exact_set = set(id(s) for s in exact)
+            partial: list[SymbolInfo] = []
+            for symbols in self._symbols.values():
+                for sym in symbols:
+                    if id(sym) in exact_set:
+                        continue
+                    if query in sym.name.lower():
+                        partial.append(sym)
+                        if len(partial) >= remaining:
+                            return exact + partial
+            return exact + partial
 
     def set_chunk_ids(self, file_path: str, chunk_ids: list[int]):
-        self._chunk_map[_normalize_path(file_path)] = chunk_ids
+        with self._lock:
+            self._chunk_map[_normalize_path(file_path)] = chunk_ids
 
     def get_chunk_ids(self, file_path: str) -> list[int]:
         return self._chunk_map.get(_normalize_path(file_path), [])
 
     def remove_file(self, file_path: str):
-        file_path = _normalize_path(file_path)
-        self._files.pop(file_path, None)
-        old = self._symbols.pop(file_path, None)
-        if old:
-            for sym in old:
-                key = sym.name.lower()
-                bucket = self._name_index.get(key)
-                if bucket is not None:
-                    try:
-                        bucket.remove(sym)
-                    except ValueError:
-                        pass
-                    if not bucket:
-                        del self._name_index[key]
-        self._chunk_map.pop(file_path, None)
+        with self._lock:
+            file_path = _normalize_path(file_path)
+            self._files.pop(file_path, None)
+            old = self._symbols.pop(file_path, None)
+            if old:
+                for sym in old:
+                    key = sym.name.lower()
+                    bucket = self._name_index.get(key)
+                    if bucket is not None:
+                        try:
+                            bucket.remove(sym)
+                        except ValueError:
+                            pass
+                        if not bucket:
+                            del self._name_index[key]
+            self._chunk_map.pop(file_path, None)
 
     def get_all_files(self) -> list[str]:
         return list(self._files.keys())
@@ -123,38 +131,54 @@ class MetadataStore:
         self, current_fingerprints: dict[str, str]
     ) -> tuple[list[str], list[str], list[str]]:
         """Returns (new_files, modified_files, deleted_files)."""
-        current_fingerprints = {
-            _normalize_path(path): fingerprint
-            for path, fingerprint in current_fingerprints.items()
-        }
-        stored = set(self._files.keys())
-        current = set(current_fingerprints.keys())
-        new_files = sorted(current - stored)
-        deleted_files = sorted(stored - current)
-        modified_files = sorted(
-            f
-            for f in stored & current
-            if self._files[f].sha256 != current_fingerprints[f]
-        )
-        return new_files, modified_files, deleted_files
+        with self._lock:
+            current_fingerprints = {
+                _normalize_path(path): fingerprint
+                for path, fingerprint in current_fingerprints.items()
+            }
+            stored = set(self._files.keys())
+            current = set(current_fingerprints.keys())
+            new_files = sorted(current - stored)
+            deleted_files = sorted(stored - current)
+            modified_files = sorted(
+                f
+                for f in stored & current
+                if self._files[f].sha256 != current_fingerprints[f]
+            )
+            return new_files, modified_files, deleted_files
 
     def save(self):
         """Persist metadata with atomic write (temp + rename)."""
-        self._store_path.parent.mkdir(parents=True, exist_ok=True)
-        data = {
-            "files": {k: self._file_to_dict(v) for k, v in self._files.items()},
-            "symbols": {
-                k: [self._symbol_to_dict(s) for s in v]
-                for k, v in self._symbols.items()
-            },
-            "chunk_map": self._chunk_map,
-        }
-        tmp_path = self._store_path.with_suffix(".json.tmp")
-        tmp_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        os.replace(tmp_path, self._store_path)
+        with self._lock:
+            self._store_path.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                "files": {k: self._file_to_dict(v) for k, v in self._files.items()},
+                "symbols": {
+                    k: [self._symbol_to_dict(s) for s in v]
+                    for k, v in self._symbols.items()
+                },
+                "chunk_map": self._chunk_map,
+            }
+            tmp_path = self._store_path.with_suffix(".json.tmp")
+            tmp_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            os.replace(tmp_path, self._store_path)
 
     def _load(self):
-        data = json.loads(self._store_path.read_text(encoding="utf-8"))
+        try:
+            data = json.loads(self._store_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError, KeyError, AttributeError, TypeError, OSError) as exc:
+            corrupt_path = self._store_path.with_suffix(
+                f".json.corrupt_{int(time.time())}"
+            )
+            try:
+                os.replace(self._store_path, corrupt_path)
+            except OSError:
+                pass
+            print(
+                f"WARNING: Metadata store corrupt ({type(exc).__name__}: {exc}). "
+                f"Renamed to {corrupt_path}. Starting fresh."
+            )
+            return
         self._files = {
             _normalize_path(k): self._dict_to_file(v)
             for k, v in data.get("files", {}).items()
@@ -221,4 +245,5 @@ class MetadataStore:
         return len(self._files)
 
     def count_symbols(self) -> int:
-        return sum(len(syms) for syms in self._symbols.values())
+        with self._lock:
+            return sum(len(syms) for syms in self._symbols.values())

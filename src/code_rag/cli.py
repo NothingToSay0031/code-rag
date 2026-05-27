@@ -263,6 +263,18 @@ def main(ctx: click.Context, update: bool) -> None:
 )
 @click.option("--device", default="auto", help="Device: auto, cpu, or cuda")
 @click.option(
+    "--chunk-size",
+    "max_chunk_tokens",
+    type=int,
+    default=None,
+    help="Max tokens per chunk (default: 4096)",
+)
+@click.option(
+    "--data-dir",
+    default=None,
+    help="Index directory name (default: .code-rag). Use to keep multiple indices side-by-side.",
+)
+@click.option(
     "--model",
     "model_name",
     default=None,
@@ -277,6 +289,8 @@ def init(
     include_patterns: tuple,
     exclude_patterns: tuple,
     device: str,
+    max_chunk_tokens: int | None,
+    data_dir: str | None,
     model_name: str | None,
 ):
     """Index a code repository for RAG search.
@@ -302,6 +316,12 @@ def init(
         existing = _load_existing_model(repo)
         if existing:
             kwargs["model_name"] = existing
+
+    if max_chunk_tokens is not None:
+        kwargs["max_chunk_tokens"] = max_chunk_tokens
+
+    if data_dir is not None:
+        kwargs["data_dir"] = data_dir
 
     config = CodeRagConfig(**kwargs)
 

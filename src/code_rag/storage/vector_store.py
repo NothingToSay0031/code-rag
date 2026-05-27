@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,7 @@ class VectorStore:
     def __init__(self, db_path: Path, dimension: int):
         self._db_path = db_path
         self._dimension = dimension
+        self._lock = threading.Lock()
         self._available = False
         self._client: Any = None
         self._collection: Any = None
@@ -37,6 +39,41 @@ class VectorStore:
 
         self._client, self._collection = self._open_chroma(chroma_dir)
         self._available = self._collection is not None
+
+        # Validate distance metric: downstream code assumes cosine similarity.
+        if self._available:
+            metric = self._collection.metadata.get("hnsw:space")
+            if metric and metric != "cosine":
+                logger.warning(
+                    "VectorStore collection uses distance metric '%s', "
+                    "but cosine is expected. Search results may be incorrect.",
+                    metric,
+                )
+
+        # Validate that existing vectors have compatible embedding dimension.
+        # If the collection already contains vectors from a different model,
+        # mixing dimensions will cause ChromaDB errors on insert/search.
+        if self._available and self._collection.count() > 0:
+            try:
+                sample = self._collection.get(limit=1, include=["embeddings"])
+                if sample and sample.get("embeddings") and sample["embeddings"]:
+                    existing_dim = len(sample["embeddings"][0])
+                    if existing_dim != dimension:
+                        logger.error(
+                            "VectorStore dimension mismatch: existing vectors have "
+                            "dimension %d but configured dimension is %d. "
+                            "Re-run 'code-rag init' to rebuild the index.",
+                            existing_dim,
+                            dimension,
+                        )
+                        self._available = False
+            except Exception as exc:
+                logger.warning(
+                    "Could not validate existing vector dimensions (%s: %s). "
+                    "Proceeding without validation.",
+                    type(exc).__name__,
+                    exc,
+                )
 
     # ------------------------------------------------------------------
 
@@ -82,49 +119,50 @@ class VectorStore:
                 "VectorStore unavailable — skipping insert of %d chunks", len(chunks)
             )
             return []
-        base_id = self._next_base_id()
-        ids: list[str] = []
-        documents: list[str] = []
-        metadatas: list[dict] = []
-        embedding_list: list[list[float]] = []
+        with self._lock:
+            base_id = self._next_base_id()
+            ids: list[str] = []
+            documents: list[str] = []
+            metadatas: list[dict] = []
+            embedding_list: list[list[float]] = []
 
-        for i, chunk in enumerate(chunks):
-            chunk_id = base_id + i
-            ids.append(str(chunk_id))
-            if len(chunk.text) > 65535:
-                import warnings
+            for i, chunk in enumerate(chunks):
+                chunk_id = base_id + i
+                ids.append(str(chunk_id))
+                if len(chunk.text) > 65535:
+                    import warnings
 
-                warnings.warn(
-                    f"Chunk text truncated from {len(chunk.text)} to 65535 chars "
-                    f"(file={chunk.file_path}, lines {chunk.start_line}-{chunk.end_line})"
+                    warnings.warn(
+                        f"Chunk text truncated from {len(chunk.text)} to 65535 chars "
+                        f"(file={chunk.file_path}, lines {chunk.start_line}-{chunk.end_line})"
+                    )
+                documents.append(chunk.text[:65535])
+                metadatas.append(
+                    {
+                        "file_path": chunk.file_path,
+                        "start_line": chunk.start_line,
+                        "end_line": chunk.end_line,
+                        "chunk_type": chunk.chunk_type,
+                        "language": chunk.language or "",
+                        "symbol_name": chunk.symbol_name or "",
+                        "symbol_kind": chunk.symbol_kind or "",
+                        "metadata_json": json.dumps(chunk.metadata),
+                    }
                 )
-            documents.append(chunk.text[:65535])
-            metadatas.append(
-                {
-                    "file_path": chunk.file_path,
-                    "start_line": chunk.start_line,
-                    "end_line": chunk.end_line,
-                    "chunk_type": chunk.chunk_type,
-                    "language": chunk.language or "",
-                    "symbol_name": chunk.symbol_name or "",
-                    "symbol_kind": chunk.symbol_kind or "",
-                    "metadata_json": json.dumps(chunk.metadata),
-                }
-            )
-            embedding_list.append(embeddings[i].tolist())
+                embedding_list.append(embeddings[i].tolist())
 
-        # ChromaDB add() has a batch size limit; split if needed
-        batch_size = 5000
-        for start in range(0, len(ids), batch_size):
-            end = start + batch_size
-            self._collection.add(
-                ids=ids[start:end],
-                embeddings=embedding_list[start:end],
-                documents=documents[start:end],
-                metadatas=metadatas[start:end],
-            )
+            # ChromaDB add() has a batch size limit; split if needed
+            batch_size = 5000
+            for start in range(0, len(ids), batch_size):
+                end = start + batch_size
+                self._collection.add(
+                    ids=ids[start:end],
+                    embeddings=embedding_list[start:end],
+                    documents=documents[start:end],
+                    metadatas=metadatas[start:end],
+                )
 
-        return list(range(base_id, base_id + len(chunks)))
+            return list(range(base_id, base_id + len(chunks)))
 
     def search(
         self,
@@ -154,9 +192,9 @@ class VectorStore:
         output = []
         for i, doc_id in enumerate(results["ids"][0]):
             meta = results["metadatas"][0][i]
-            distance = results["distances"][0][i] if results["distances"] else 0.0
+            distance = results["distances"][0][i] if results["distances"] else None
             # cosine space: distance = 1 - cosine_similarity → score = 1 - distance
-            score = 1.0 - distance
+            score = 1.0 - distance if distance is not None else 0.5
             entry = {
                 "text": results["documents"][0][i],
                 "file_path": meta.get("file_path", ""),
@@ -265,7 +303,17 @@ class VectorStore:
         return self._collection.count()
 
     def close(self):
-        pass  # ChromaDB PersistentClient auto-persists; no explicit close needed
+        """Release ChromaDB references so the database can be moved or deleted.
+
+        On Windows, the PersistentClient holds file locks on SQLite files
+        that prevent directory cleanup.  This clears references and forces
+        garbage collection so Python-side file handles are released.
+        """
+        self._client = None
+        self._collection = None
+        self._available = False
+        import gc
+        gc.collect()
 
     @staticmethod
     def _parse_filter(filter_expr: str) -> dict | None:

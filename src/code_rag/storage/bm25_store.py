@@ -1,6 +1,8 @@
 import os
 import pickle
 import re
+import threading
+import time
 from pathlib import Path
 
 from rank_bm25 import BM25Okapi
@@ -112,6 +114,7 @@ def _tokenize_code(text: str) -> list[str]:
 class BM25Store:
     def __init__(self, store_path: Path):
         self._store_path = store_path
+        self._lock = threading.RLock()
         self._corpus: list[list[str]] = []  # tokenized docs
         self._doc_ids: list[int] = []  # chunk IDs
         self._chunks: list[Chunk] = []  # full chunk data for retrieval
@@ -125,88 +128,94 @@ class BM25Store:
         return _tokenize_code(text)
 
     def add(self, chunk_id: int, chunk: Chunk):
-        tokens = self._tokenize(chunk.text)
-        idx = len(self._corpus)
-        self._corpus.append(tokens)
-        self._doc_ids.append(chunk_id)
-        self._chunks.append(chunk)
-        self._file_map.setdefault(chunk.file_path, []).append(idx)
-        self._dirty = True
-
-    def add_batch(self, chunk_ids: list[int], chunks: list[Chunk]):
-        for cid, chunk in zip(chunk_ids, chunks):
+        with self._lock:
             tokens = self._tokenize(chunk.text)
             idx = len(self._corpus)
             self._corpus.append(tokens)
-            self._doc_ids.append(cid)
+            self._doc_ids.append(chunk_id)
             self._chunks.append(chunk)
             self._file_map.setdefault(chunk.file_path, []).append(idx)
-        self._dirty = True
+            self._dirty = True
+
+    def add_batch(self, chunk_ids: list[int], chunks: list[Chunk]):
+        with self._lock:
+            for cid, chunk in zip(chunk_ids, chunks):
+                tokens = self._tokenize(chunk.text)
+                idx = len(self._corpus)
+                self._corpus.append(tokens)
+                self._doc_ids.append(cid)
+                self._chunks.append(chunk)
+                self._file_map.setdefault(chunk.file_path, []).append(idx)
+            self._dirty = True
 
     def remove_by_file(self, file_path: str):
-        self.remove_by_files([file_path])
+        with self._lock:
+            self.remove_by_files([file_path])
 
     def remove_by_files(self, file_paths: list[str]):
         """Batch-remove multiple files in a single pass over the corpus."""
-        remove_set: set[int] = set()
-        for fp in file_paths:
-            indices = self._file_map.pop(fp, [])
-            remove_set.update(indices)
-        if not remove_set:
-            return
-        new_corpus = []
-        new_doc_ids = []
-        new_chunks = []
-        new_file_map: dict[str, list[int]] = {}
-        for i, (tokens, doc_id, chunk) in enumerate(
-            zip(self._corpus, self._doc_ids, self._chunks)
-        ):
-            if i in remove_set:
-                continue
-            new_idx = len(new_corpus)
-            new_corpus.append(tokens)
-            new_doc_ids.append(doc_id)
-            new_chunks.append(chunk)
-            new_file_map.setdefault(chunk.file_path, []).append(new_idx)
-        self._corpus = new_corpus
-        self._doc_ids = new_doc_ids
-        self._chunks = new_chunks
-        self._file_map = new_file_map
-        self._dirty = True
+        with self._lock:
+            remove_set: set[int] = set()
+            for fp in file_paths:
+                indices = self._file_map.pop(fp, [])
+                remove_set.update(indices)
+            if not remove_set:
+                return
+            new_corpus = []
+            new_doc_ids = []
+            new_chunks = []
+            new_file_map: dict[str, list[int]] = {}
+            for i, (tokens, doc_id, chunk) in enumerate(
+                zip(self._corpus, self._doc_ids, self._chunks)
+            ):
+                if i in remove_set:
+                    continue
+                new_idx = len(new_corpus)
+                new_corpus.append(tokens)
+                new_doc_ids.append(doc_id)
+                new_chunks.append(chunk)
+                new_file_map.setdefault(chunk.file_path, []).append(new_idx)
+            self._corpus = new_corpus
+            self._doc_ids = new_doc_ids
+            self._chunks = new_chunks
+            self._file_map = new_file_map
+            self._dirty = True
 
     def search(self, query: str, top_k: int = 10) -> list[tuple[Chunk, float]]:
-        if not self._corpus:
-            return []
-        if self._dirty or self._bm25 is None:
-            self._bm25 = BM25Okapi(self._corpus)
-            self._dirty = False
-        tokens = self._tokenize(query)
-        if not tokens:
-            return []
-        scores = self._bm25.get_scores(tokens)
-        query_tokens = set(tokens)
-        top_indices = scores.argsort()[::-1][:top_k]
-        results = []
-        for idx in top_indices:
-            # In very small corpora, rank_bm25 can assign zero IDF to matching
-            # terms. Keep real lexical hits instead of dropping them as no-match.
-            if scores[idx] > 0 or query_tokens.intersection(self._corpus[idx]):
-                results.append((self._chunks[idx], float(scores[idx])))
-        return results
+        with self._lock:
+            if not self._corpus:
+                return []
+            if self._dirty or self._bm25 is None:
+                self._bm25 = BM25Okapi(self._corpus)
+                self._dirty = False
+            tokens = self._tokenize(query)
+            if not tokens:
+                return []
+            scores = self._bm25.get_scores(tokens)
+            query_tokens = set(tokens)
+            top_indices = scores.argsort()[::-1][:top_k]
+            results = []
+            for idx in top_indices:
+                # In very small corpora, rank_bm25 can assign zero IDF to matching
+                # terms. Keep real lexical hits instead of dropping them as no-match.
+                if scores[idx] > 0 or query_tokens.intersection(self._corpus[idx]):
+                    results.append((self._chunks[idx], float(scores[idx])))
+            return results
 
     def save(self):
         """Persist BM25 data with atomic write (temp + rename)."""
-        self._store_path.parent.mkdir(parents=True, exist_ok=True)
-        data = {
-            "corpus": self._corpus,
-            "doc_ids": self._doc_ids,
-            "chunks": self._chunks,
-            "file_map": self._file_map,
-        }
-        tmp_path = self._store_path.with_suffix(".pkl.tmp")
-        with open(tmp_path, "wb") as f:
-            pickle.dump(data, f)
-        os.replace(tmp_path, self._store_path)
+        with self._lock:
+            self._store_path.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                "corpus": self._corpus,
+                "doc_ids": self._doc_ids,
+                "chunks": self._chunks,
+                "file_map": self._file_map,
+            }
+            tmp_path = self._store_path.with_suffix(".pkl.tmp")
+            with open(tmp_path, "wb") as f:
+                pickle.dump(data, f)
+            os.replace(tmp_path, self._store_path)
 
     def _load(self):
         try:
@@ -217,9 +226,17 @@ class BM25Store:
             self._chunks = data["chunks"]
             self._file_map = data["file_map"]
             self._dirty = True
-        except (EOFError, pickle.UnpicklingError, KeyError, Exception) as exc:
+        except (EOFError, pickle.UnpicklingError, KeyError, TypeError, AttributeError, OSError) as exc:
+            corrupt_path = self._store_path.with_suffix(
+                f".pkl.corrupt_{int(time.time())}"
+            )
+            try:
+                os.replace(self._store_path, corrupt_path)
+            except OSError:
+                pass
             print(
                 f"WARNING: BM25 store corrupt ({type(exc).__name__}: {exc}). "
+                f"Renamed to {corrupt_path}. "
                 f"Starting fresh — BM25 keyword search will be rebuilt."
             )
             self._corpus = []

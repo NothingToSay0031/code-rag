@@ -247,6 +247,7 @@ class IndexPipeline:
         print(f"Discovered {len(files)} files")
 
         current_fingerprints: dict[str, str] = {}
+        fingerprint_failed: set[str] = set()
         max_workers = min(8, (os.cpu_count() or 4))
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             future_to_path: dict = {}
@@ -261,7 +262,11 @@ class IndexPipeline:
                 total=len(files),
             ):
                 key = future_to_path[future]
-                current_fingerprints[key] = future.result()
+                try:
+                    current_fingerprints[key] = future.result()
+                except Exception as e:
+                    print(f"Warning: Failed to fingerprint {key}: {e}, skipping")
+                    fingerprint_failed.add(key)
 
         print("Computing delta (new / modified / deleted files)...")
         new_files, modified_files, deleted_files = self._metadata.get_changed_files(
@@ -272,6 +277,15 @@ class IndexPipeline:
             f"{len(deleted_files)} deleted"
         )
 
+        # Fingerprint failures mean we don't know if the file changed.
+        # Treat them as unchanged (keep old data) rather than deleted.
+        if fingerprint_failed:
+            deleted_files = [f for f in deleted_files if f not in fingerprint_failed]
+            print(
+                f"  {len(fingerprint_failed)} file(s) skipped fingerprinting, "
+                f"keeping old data"
+            )
+
         if deleted_files:
             print(f"  Cleaning up {len(deleted_files)} deleted files...")
             deleted_chunk_ids: dict[str, list[int]] = {}
@@ -279,24 +293,26 @@ class IndexPipeline:
                 cids = self._metadata.get_chunk_ids(fp)
                 if cids:
                     deleted_chunk_ids[fp] = cids
-            self._vector_store.delete_by_files(deleted_files, deleted_chunk_ids)
-            self._bm25_store.remove_by_files(deleted_files)
+            # Clean stores first, then remove metadata after stores confirm success
+            try:
+                self._vector_store.delete_by_files(deleted_files, deleted_chunk_ids)
+            except Exception as e:
+                print(
+                    f"Warning: Failed to clean vector store for "
+                    f"{len(deleted_files)} deleted files: {e}"
+                )
+            try:
+                self._bm25_store.remove_by_files(deleted_files)
+            except Exception as e:
+                print(
+                    f"Warning: Failed to clean BM25 store for "
+                    f"{len(deleted_files)} deleted files: {e}"
+                )
             for file_path in deleted_files:
                 self._metadata.remove_file(file_path)
 
         files_to_process = new_files + modified_files
-
-        if modified_files:
-            print(f"  Cleaning up {len(modified_files)} modified files...")
-            modified_chunk_ids: dict[str, list[int]] = {}
-            for fp in modified_files:
-                cids = self._metadata.get_chunk_ids(fp)
-                if cids:
-                    modified_chunk_ids[fp] = cids
-            self._vector_store.delete_by_files(modified_files, modified_chunk_ids)
-            self._bm25_store.remove_by_files(modified_files)
-            for file_path in modified_files:
-                self._metadata.remove_file(file_path)
+        previously_indexed = set(modified_files)  # Files that already had metadata
 
         # -- Resume detection --------------------------------------------------
         # Files parsed in a previous run (metadata saved at checkpoint) but
@@ -351,10 +367,13 @@ class IndexPipeline:
         work_lock = threading.Lock()
         work_idx = 0
         result_queue: Queue[_FileProcessResult | None] = Queue()
+        stopping = threading.Event()
 
         def worker() -> None:
             nonlocal work_idx
             while True:
+                if stopping.is_set():
+                    return
                 with work_lock:
                     if work_idx >= len(work_items):
                         return
@@ -380,6 +399,7 @@ class IndexPipeline:
         PARALLEL_TIMEOUT = 120
         SHORT_POLL = 5  # check for stall every N seconds
         collected = 0
+        result_files: set[str] = set()
         total = len(files_to_process)
         last_progress = time.time()
         pbar = tqdm(total=total, desc="Parsing & chunking", unit="file")
@@ -400,24 +420,37 @@ class IndexPipeline:
             collected += 1
             pbar.update(1)
 
-            if result.status == "error":
-                self._metadata.remove_file(result.file_path_str)
-            elif result.status in ("unknown", "no_chunks"):
-                self._metadata.set_file_info(
-                    result.file_path_str, result.file_info
-                )
-            elif result.status == "success":
-                all_file_chunks[result.file_path_str] = result.chunks
-                self._metadata.set_file_info(
-                    result.file_path_str, result.file_info
-                )
-                self._metadata.set_symbols(
-                    result.file_path_str, result.symbols
-                )
+            result_files.add(result.file_path_str)
+            self._process_parse_result(result, all_file_chunks, previously_indexed)
+
+        # Signal workers to stop and drain remaining results from the queue
+        # before stuck detection, so any late-arriving results are captured.
+        stopping.set()
+        while not result_queue.empty():
+            try:
+                result = result_queue.get_nowait()
+                if result is not None:
+                    result_files.add(result.file_path_str)
+                    self._process_parse_result(result, all_file_chunks, previously_indexed)
+            except Exception:
+                pass
 
         # Collect files that didn't complete in the parallel phase
         with work_lock:
-            stuck = [work_items[i] for i in range(work_idx, len(work_items))]
+            captured_idx = work_idx
+        stuck = [work_items[i] for i in range(captured_idx, len(work_items))]
+
+        # Also check for files whose work_idx was claimed but never returned results
+        missing_from_results = [
+            fp for fp in work_items[:captured_idx]
+            if fp not in result_files
+        ]
+        if missing_from_results:
+            print(
+                f"Warning: {len(missing_from_results)} file(s) claimed by "
+                f"workers but never returned results"
+            )
+            stuck.extend(missing_from_results)
 
         pbar.close()
 
@@ -433,7 +466,8 @@ class IndexPipeline:
             )
             pbar2 = tqdm(total=len(stuck), desc="Parsing (retry)", unit="file")
 
-            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            pool = ThreadPoolExecutor(max_workers=max_workers)
+            try:
                 future_to_path = {}
                 for fp in stuck:
                     future = pool.submit(
@@ -469,22 +503,12 @@ class IndexPipeline:
                             pbar2.update(1)
                             continue
 
-                        if result.status == "error":
-                            self._metadata.remove_file(result.file_path_str)
-                        elif result.status in ("unknown", "no_chunks"):
-                            self._metadata.set_file_info(
-                                result.file_path_str, result.file_info
-                            )
-                        elif result.status == "success":
-                            all_file_chunks[result.file_path_str] = result.chunks
-                            self._metadata.set_file_info(
-                                result.file_path_str, result.file_info
-                            )
-                            self._metadata.set_symbols(
-                                result.file_path_str, result.symbols
-                            )
-
+                        self._process_parse_result(
+                            result, all_file_chunks, previously_indexed
+                        )
                         pbar2.update(1)
+            finally:
+                pool.shutdown(wait=False)
 
             pbar2.close()
             if skipped_timeout:
@@ -548,9 +572,13 @@ class IndexPipeline:
             for batch_num, batch_files in enumerate(batches, 1):
                 # Clean up any partial data from a previously failed batch
                 # so re-running is idempotent.
+                batch_chunk_ids_map: dict[str, list[int]] = {}
                 for f in batch_files:
-                    self._vector_store.delete_by_file(f)
-                    self._bm25_store.remove_by_file(f)
+                    cids = self._metadata.get_chunk_ids(f)
+                    if cids:
+                        batch_chunk_ids_map[f] = cids
+                self._vector_store.delete_by_files(batch_files, batch_chunk_ids_map)
+                self._bm25_store.remove_by_files(batch_files)
 
                 batch_chunks = []
                 batch_file_map: list[tuple[str, int]] = []
@@ -715,6 +743,37 @@ class IndexPipeline:
             "chunks": self._vector_store.count(),
         }
 
+    def _process_parse_result(
+        self,
+        result: _FileProcessResult,
+        all_file_chunks: dict[str, list],
+        previously_indexed: set[str],
+    ) -> None:
+        """Process a parse result from a worker thread.
+
+        Args:
+            result: The parse result.
+            all_file_chunks: Dict accumulating successful chunks.
+            previously_indexed: Set of file paths that already had metadata
+                (modified files).  For these, parse errors do *not* delete
+                old metadata so the previous index data is preserved.
+        """
+        if result.status == "error":
+            if result.file_path_str in previously_indexed:
+                print(
+                    f"Warning: previously indexed file "
+                    f"{result.file_path_str} failed to parse, "
+                    f"keeping old index data (file unchanged)"
+                )
+            else:
+                self._metadata.remove_file(result.file_path_str)
+        elif result.status in ("unknown", "no_chunks"):
+            self._metadata.set_file_info(result.file_path_str, result.file_info)
+        elif result.status == "success":
+            all_file_chunks[result.file_path_str] = result.chunks
+            self._metadata.set_file_info(result.file_path_str, result.file_info)
+            self._metadata.set_symbols(result.file_path_str, result.symbols)
+
     def _rebuild_bm25_if_needed(self, config: CodeRagConfig) -> None:
         """Rebuild BM25 entries for indexed files missing from BM25 store.
 
@@ -723,6 +782,9 @@ class IndexPipeline:
         keyword search without re-embedding.
         """
         # Collect files that have chunk_ids (= fully embedded) but aren't in BM25
+        # NOTE: Direct access to _file_map is a tight coupling with BM25Store.
+        # A public method (e.g. get_indexed_files()) should be added to BM25Store
+        # to replace this.
         bm25_files = set(self._bm25_store._file_map.keys())
         files_needing_bm25: list[str] = []
         for fp in self._metadata.get_all_files():
@@ -739,12 +801,15 @@ class IndexPipeline:
         )
 
         rebuilt = 0
+        skipped_no_lang = 0
+        skipped_mismatch = 0
         max_workers = min(8, (os.cpu_count() or 4))
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             future_to_path: dict = {}
             for file_path_str in files_needing_bm25:
                 info = self._metadata.get_file_info(file_path_str)
                 if not info or not info.language:
+                    skipped_no_lang += 1
                     continue
                 future_to_path[
                     pool.submit(
@@ -766,6 +831,12 @@ class IndexPipeline:
 
                 chunk_ids = self._metadata.get_chunk_ids(file_path_str)
                 if len(chunks) != len(chunk_ids):
+                    print(
+                        f"Warning: chunk count mismatch for {file_path_str}: "
+                        f"parsed {len(chunks)} chunks but metadata has "
+                        f"{len(chunk_ids)} chunk_ids, skipping"
+                    )
+                    skipped_mismatch += 1
                     continue
 
                 self._bm25_store.add_batch(chunk_ids, chunks)
@@ -774,3 +845,13 @@ class IndexPipeline:
         if rebuilt > 0:
             self._bm25_store.save()
             print(f"BM25 rebuilt for {rebuilt} files.")
+        if skipped_no_lang:
+            print(
+                f"  Skipped {skipped_no_lang} file(s) due to "
+                f"missing language metadata"
+            )
+        if skipped_mismatch:
+            print(
+                f"  Skipped {skipped_mismatch} file(s) due to "
+                f"chunk count mismatch"
+            )

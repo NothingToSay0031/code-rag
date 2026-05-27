@@ -63,7 +63,11 @@ class HybridRetriever:
         semantic_results = self._semantic.search(
             query, top_k=fetch_k * 2, language=language
         )
-        keyword_results = self._keyword.search(query, top_k=fetch_k * 2)
+        # Over-fetch keyword results when language filter is active to compensate
+        # for post-hoc filtering, which reduces the effective keyword contribution
+        # compared to semantic's ChromaDB-level filter.
+        keyword_fetch = fetch_k * 3 if language else fetch_k * 2
+        keyword_results = self._keyword.search(query, top_k=keyword_fetch)
 
         # If language filter specified, also filter keyword results
         if language:
@@ -132,16 +136,54 @@ class HybridRetriever:
         """
         excl = _resolve_exclude(exclude_paths)
         fetch_k = top_k * (_FILTER_OVERFETCH if excl else 2)
-        # All filtering applied here in a single pass; disable inside search().
-        results = self.search(query, top_k=fetch_k, language=None, exclude_paths=[])
-        filtered = [
-            r
-            for r in results
+        # Pass chunk_type and language filters directly to semantic retriever
+        # and filter keyword results early to avoid wasteful RRF ranking.
+        semantic_results = self._semantic.search(
+            query, top_k=fetch_k * 2, language=language, chunk_type=chunk_type
+        )
+        keyword_results = self._keyword.search(query, top_k=fetch_k * 2)
+        # Apply chunk_type and language filters to keyword results early
+        keyword_results = [
+            r for r in keyword_results
             if (chunk_type is None or r.chunk.chunk_type == chunk_type)
-            and (language is None or r.chunk.language == language)
-            and not (excl and _path_matches_any(r.chunk.file_path, excl))
         ]
-        return filtered[:top_k]
+        if language:
+            keyword_results = [
+                r for r in keyword_results if r.chunk.language == language
+            ]
+
+        # RRF: score(d) = Σ 1/(k + rank_i)
+        rrf_scores: dict[tuple, float] = {}
+        result_map: dict[tuple, SearchResult] = {}
+
+        for rank, r in enumerate(semantic_results, start=1):
+            key = (r.chunk.file_path, r.chunk.start_line, r.chunk.end_line)
+            rrf_scores[key] = 1.0 / (_RRF_K + rank)
+            result_map[key] = r
+
+        for rank, r in enumerate(keyword_results, start=1):
+            key = (r.chunk.file_path, r.chunk.start_line, r.chunk.end_line)
+            rrf_scores[key] = rrf_scores.get(key, 0.0) + 1.0 / (_RRF_K + rank)
+            if key not in result_map:
+                result_map[key] = r
+
+        sorted_keys = sorted(rrf_scores, key=lambda k: rrf_scores[k], reverse=True)
+        _rrf_max = 2.0 / (_RRF_K + 1)
+
+        output: list[SearchResult] = []
+        for k in sorted_keys:
+            if excl and _path_matches_any(result_map[k].chunk.file_path, excl):
+                continue
+            output.append(
+                SearchResult(
+                    chunk=result_map[k].chunk,
+                    score=rrf_scores[k] / _rrf_max,
+                    source="hybrid",
+                )
+            )
+            if len(output) >= top_k:
+                break
+        return output
 
     def search_code(
         self,

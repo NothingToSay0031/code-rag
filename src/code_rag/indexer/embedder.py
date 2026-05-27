@@ -57,6 +57,7 @@ class Embedder:
         self._model = None  # LAZY LOADING
         self._resolved_device: str | None = None
         self._cached_max_seq: int | None = None
+        self._cached_dimension: int | None = None
         self._backend: str | None = None  # "onnx" or "sentence_transformers"
         self._tokenizer_obj = None  # Lazy-loaded tokenizer (lightweight, no model)
 
@@ -154,6 +155,8 @@ class Embedder:
                 f"HuggingFace Hub: https://huggingface.co/{self._model_name}"
             ) from exc
         self._backend = "static"
+        self._cached_dimension = None
+        self._cached_max_seq = None
         print(f"Model loaded (static). Dimension: {self.dimension}")
 
     def _load_onnx(self):
@@ -168,15 +171,22 @@ class Embedder:
         )
         # Cap at the model's actual position embedding limit (see
         # _load_sentence_transformers for the full rationale).
-        from transformers import AutoConfig
+        # Try the loaded model's max_seq_length first to avoid a redundant
+        # config load; fall back to a separate AutoConfig if that fails.
+        try:
+            model_max = self._model.max_seq_length
+        except Exception:
+            from transformers import AutoConfig
 
-        config = AutoConfig.from_pretrained(self._model_name)
-        model_max = getattr(config, "max_position_embeddings", None) or getattr(
-            config, "n_positions", None
-        ) or 512
-        requested = self._max_seq_length or model_max
+            config = AutoConfig.from_pretrained(self._model_name)
+            model_max = getattr(config, "max_position_embeddings", None) or getattr(
+                config, "n_positions", None
+            ) or 512
+        requested = self._max_seq_length if self._max_seq_length is not None else model_max
         self._model.max_seq_length = min(requested, model_max)
         self._backend = "onnx"
+        self._cached_dimension = None
+        self._cached_max_seq = None
         print(f"Model loaded (ONNX). Dimension: {self.dimension}")
 
     def _load_sentence_transformers(self):
@@ -197,12 +207,22 @@ class Embedder:
         # position embeddings).  config.max_chunk_tokens is 4096 for
         # chunking; the embedder must cap it to the model's real limit
         # or the forward pass will crash with a tensor-size mismatch.
-        model_max = getattr(
-            self._model[0].auto_model.config, "max_position_embeddings", None
-        ) or getattr(self._model[0].auto_model.config, "n_positions", None) or 512
-        requested = self._max_seq_length or model_max
+        # Try the loaded model's max_seq_length first to avoid a redundant
+        # config load; fall back to a separate AutoConfig if that fails.
+        try:
+            model_max = self._model.max_seq_length
+        except Exception:
+            from transformers import AutoConfig
+
+            config = AutoConfig.from_pretrained(self._model_name)
+            model_max = getattr(config, "max_position_embeddings", None) or getattr(
+                config, "n_positions", None
+            ) or 512
+        requested = self._max_seq_length if self._max_seq_length is not None else model_max
         self._model.max_seq_length = min(requested, model_max)
         self._backend = "sentence_transformers"
+        self._cached_dimension = None
+        self._cached_max_seq = None
         print(f"Model loaded (torch). Dimension: {self.dimension}")
 
     def _get_free_vram_gb(self, flush_cache: bool = True) -> float:
@@ -227,17 +247,6 @@ class Embedder:
         except Exception:
             return 0.0
 
-    def _compute_batch_size(self) -> int:
-        """Backward-compatible wrapper: safe batch size for max_seq_length.
-
-        Prefer :meth:`_compute_batch_size_for_seq_len` when the actual token
-        length of the current group is known.
-        """
-        self._resolve_device()
-        if self._resolved_device != "cuda":
-            return 64
-        seq_len = getattr(self._model, "max_seq_length", None) or 512
-        return self._compute_batch_size_for_seq_len(seq_len, self._get_free_vram_gb())
 
     def _compute_batch_size_for_seq_len(self, seq_len: int, free_gb: float) -> int:
         """Calculate a safe mini-batch size for a specific sequence length.
@@ -297,7 +306,7 @@ class Embedder:
         """
         if self._tokenizer_obj is not None:
             return len(self._tokenizer_obj.encode(text, add_special_tokens=False))
-        return max(1, len(text.split()))
+        return max(1, len(text.split())) if text and text.strip() else 0
 
     def embed_passages(self, texts: list[str], lengths: list[int] | None = None) -> np.ndarray:
         """Embed passages with length-aware batching to prevent VRAM overflow.
@@ -570,8 +579,16 @@ class Embedder:
             # Qwen3 Embedding uses an explicit instruction header on the query side.
             # Documents are encoded without any prefix.
             prefixed = f"Instruct: {QWEN3_QUERY_INSTRUCTION}\nQuery:{query}"
-        else:
+        elif "bge" in self._model_name.lower():
             prefixed = BGE_QUERY_INSTRUCTION + query
+        elif "e5" in self._model_name.lower():
+            # E5-family models use "query: " prefix for asymmetric retrieval
+            prefixed = "query: " + query
+        else:
+            # Unknown model family — no query instruction prefix is applied.
+            # If this model expects a specific query prefix (e.g. GTE, Jina),
+            # add explicit support here.
+            prefixed = query
         return np.asarray(
             self._model.encode(
                 prefixed,
@@ -581,10 +598,17 @@ class Embedder:
 
     @property
     def dimension(self) -> int:
+        if self._cached_dimension is not None:
+            return self._cached_dimension
         self._resolve_device()
-        # Prefer the loaded model's actual dimension when available
-        if self._model is not None and self._is_static():
-            return self._model.dim
+        # Prefer the loaded model's actual dimension when available.
+        if self._model is not None:
+            if self._is_static():
+                self._cached_dimension = self._model.dim
+                return self._cached_dimension
+            if hasattr(self._model, "get_sentence_embedding_dimension"):
+                self._cached_dimension = self._model.get_sentence_embedding_dimension()
+                return self._cached_dimension
         # Try to read the real hidden size from the model config before falling
         # back to the hard-coded dict.  This prevents silent dimension mismatches
         # (e.g. 768-dim model creating a 384-dim vector store).
@@ -594,10 +618,12 @@ class Embedder:
             config = AutoConfig.from_pretrained(self._model_name)
             dim = getattr(config, "hidden_size", None) or getattr(config, "d_model", None)
             if dim is not None:
+                self._cached_dimension = dim
                 return dim
         except Exception:
             pass
-        return MODEL_CONFIGS.get(self._model_name, 384)
+        self._cached_dimension = MODEL_CONFIGS.get(self._model_name, 384)
+        return self._cached_dimension
 
     @property
     def effective_max_seq_length(self) -> int:
@@ -615,7 +641,9 @@ class Embedder:
             return self._cached_max_seq
         requested = self._max_seq_length
         if self._is_static():
-            self._cached_max_seq = requested or 512
+            # Static models have no position-embedding cap, so the requested
+            # value (or a generous default) applies verbatim.
+            self._cached_max_seq = requested if requested is not None else 4096
             return self._cached_max_seq
 
         from transformers import AutoConfig

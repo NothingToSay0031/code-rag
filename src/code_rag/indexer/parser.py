@@ -50,6 +50,7 @@ LANGUAGE_CONFIGS: dict[str, LanguageConfig] = {
             "class": ["class_declaration"],
             "method": ["method_definition"],
             "interface": ["interface_declaration"],
+            "enum": ["enum_declaration"],
         },
         name_field="name",
     ),
@@ -61,6 +62,7 @@ LANGUAGE_CONFIGS: dict[str, LanguageConfig] = {
             "class": ["class_declaration"],
             "method": ["method_definition"],
             "interface": ["interface_declaration"],
+            "enum": ["enum_declaration"],
         },
         name_field="name",
     ),
@@ -71,6 +73,8 @@ LANGUAGE_CONFIGS: dict[str, LanguageConfig] = {
             "function": ["function_definition"],
             "class": ["class_specifier", "struct_specifier"],
             "method": ["function_definition"],
+            "enum": ["enum_specifier"],
+            "namespace": ["namespace_definition"],
         },
         name_field="declarator",
     ),
@@ -81,6 +85,7 @@ LANGUAGE_CONFIGS: dict[str, LanguageConfig] = {
             "function": ["function_definition"],
             "struct": ["struct_specifier"],
             "enum": ["enum_specifier"],
+            "union": ["union_specifier"],
         },
         name_field="declarator",
     ),
@@ -88,7 +93,7 @@ LANGUAGE_CONFIGS: dict[str, LanguageConfig] = {
         module="tree_sitter_java",
         factory="language",
         node_types={
-            "class": ["class_declaration"],
+            "class": ["class_declaration", "enum_declaration", "record_declaration"],
             "method": ["method_declaration"],
             "interface": ["interface_declaration"],
         },
@@ -167,7 +172,7 @@ LANGUAGE_ALIASES: dict[str, str] = {
     "ush": "cpp",
 }
 
-CONTAINER_KINDS = {"class", "struct", "interface", "impl", "trait", "namespace", "type"}
+CONTAINER_KINDS = {"class", "struct", "interface", "impl", "trait", "type", "enum"}
 IDENTIFIER_NODE_TYPES = {
     "identifier",
     "field_identifier",
@@ -383,7 +388,7 @@ def _has_semantic_body(node) -> bool:
 
 
 def _should_include_symbol(node, kind: str) -> bool:
-    if kind in {"class", "struct", "enum", "interface", "trait", "namespace", "impl"}:
+    if kind in {"class", "struct", "enum", "union", "interface", "trait", "namespace", "impl"}:
         return _has_semantic_body(node)
     return True
 

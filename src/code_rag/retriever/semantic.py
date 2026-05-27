@@ -17,6 +17,9 @@ class SemanticRetriever:
         chunk_type: str | None = None,
     ) -> list[SearchResult]:
         """Semantic search using dense vectors."""
+        if not query or not query.strip():
+            return []
+
         embedding = self._embedder.embed_query(query)
 
         # Build filter expression
@@ -42,7 +45,7 @@ class SemanticRetriever:
                 language=hit.get("language", None) or None,
                 symbol_name=hit.get("symbol_name", None) or None,
                 symbol_kind=hit.get("symbol_kind", None) or None,
-                metadata=json.loads(hit.get("metadata_json", "{}"))
+                metadata=json.loads(hit.get("metadata_json") or "{}")
                 if "metadata_json" in hit
                 else {},
             )

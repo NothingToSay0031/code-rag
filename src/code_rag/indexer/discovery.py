@@ -25,6 +25,8 @@ _JUNK_DIRS: frozenset[str] = frozenset(
         "venv",
         "build",
         "dist",
+        "target",
+        "vendor",
         ".tox",
         ".code-rag",
     }
@@ -41,8 +43,13 @@ _EXTENSION_MAP: dict[str, str] = {
     # Code
     ".py": "python",
     ".js": "javascript",
+    ".jsx": "javascript",
+    ".mjs": "javascript",
+    ".cjs": "javascript",
     ".ts": "typescript",
     ".tsx": "tsx",
+    ".mts": "typescript",
+    ".cts": "typescript",
     ".cpp": "cpp",
     ".cc": "cpp",
     ".cxx": "cpp",
@@ -118,10 +125,9 @@ def detect_language(
 ) -> str | None:
     """Detect language from file extension or special filename.
 
-    *custom_mappings* map extensions to the tree-sitter grammar used for
-    **parsing** (e.g. ``{".glsl": "c"}``).  However the returned language
-    identity is the **extension name** (e.g. ``"glsl"``), not the grammar.
-    The parser resolves the grammar via ``LANGUAGE_ALIASES`` at parse time.
+    *custom_mappings* map extensions to the language identity
+    (e.g. ``{".glsl": "c"}``).  The parser resolves the language identity
+    to a grammar via ``LANGUAGE_ALIASES`` at parse time.
 
     Returns ``None`` for unrecognised files.
     """
@@ -133,10 +139,10 @@ def detect_language(
 
     suffix = path.suffix.lower()
 
-    # Custom overrides: return extension name as language identity
-    # (the parser maps it to the grammar via LANGUAGE_ALIASES)
+    # Custom overrides: use the mapped language identity directly
+    # (the parser resolves it to the grammar via LANGUAGE_ALIASES)
     if custom_mappings and suffix in custom_mappings:
-        return suffix.lstrip(".")
+        return custom_mappings[suffix]
 
     return _EXTENSION_MAP.get(suffix)
 
