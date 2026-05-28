@@ -19,6 +19,10 @@ class MetadataStore:
         self._chunk_map: dict[str, list[int]] = {}  # file_path → chunk IDs
         # Inverted index: lowered symbol name → list of SymbolInfo
         self._name_index: dict[str, list[SymbolInfo]] = {}
+        # Clean up orphaned temp file from a previous crash during save
+        tmp_path = store_path.with_suffix(store_path.suffix + ".tmp")
+        if tmp_path.exists():
+            tmp_path.unlink()
         if store_path.exists():
             self._load()
 
@@ -104,7 +108,8 @@ class MetadataStore:
             self._chunk_map[_normalize_path(file_path)] = chunk_ids
 
     def get_chunk_ids(self, file_path: str) -> list[int]:
-        return self._chunk_map.get(_normalize_path(file_path), [])
+        with self._lock:
+            return self._chunk_map.get(_normalize_path(file_path), [])
 
     def remove_file(self, file_path: str):
         with self._lock:

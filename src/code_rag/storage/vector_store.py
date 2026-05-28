@@ -241,15 +241,24 @@ class VectorStore:
         if not self._available or not file_paths:
             return
 
-        # Fast path: ID-based deletion
+        # Fast path: ID-based deletion for files with known chunk IDs.
+        # Files without known IDs fall through to the slow path so that
+        # orphaned vectors (crash between insert and set_chunk_ids) are
+        # cleaned up via metadata-filter scan.
         if chunk_ids_map:
             all_ids: list[int] = []
+            uncovered: list[str] = []
             for fp in file_paths:
                 ids = chunk_ids_map.get(fp, [])
-                all_ids.extend(ids)
+                if ids:
+                    all_ids.extend(ids)
+                else:
+                    uncovered.append(fp)
             if all_ids:
                 self.delete_by_ids(all_ids)
-            return
+            if not uncovered:
+                return
+            file_paths = uncovered  # fall through to slow path
 
         # Slow path: metadata-filter deletion (legacy / fallback)
         try:

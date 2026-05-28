@@ -569,16 +569,40 @@ class IndexPipeline:
                 batches.append(cur_batch)
 
             files_done = 0
+            # Background metadata save — overlaps disk I/O with next batch's
+            # embedding.  At most 1 save in flight: we join before mutating
+            # chunk_ids, so embedding faster than disk naturally back-pressures.
+            _save_thread: threading.Thread | None = None
+            _save_error: list[Exception] = []  # captured from background thread
+
+            # Idempotency cleanup: delete stale data from a previous crashed
+            # run before re-embedding the same files.
+            # Quick check: if metadata has no files at all, definitely fresh.
+            if self._metadata.count_files() == 0:
+                _is_resume = False
+            else:
+                _is_resume = any(
+                    self._metadata.get_chunk_ids(f)
+                    for batch in batches
+                    for f in batch
+                )
+            # Belt and suspenders: ChromaDB may have vectors from a crashed
+            # run even when metadata has no chunk_ids (crash between insert()
+            # and set_chunk_ids()).  Force cleanup to catch those orphans.
+            if not _is_resume and self._vector_store.count() > 0:
+                _is_resume = True
+
             for batch_num, batch_files in enumerate(batches, 1):
-                # Clean up any partial data from a previously failed batch
-                # so re-running is idempotent.
-                batch_chunk_ids_map: dict[str, list[int]] = {}
-                for f in batch_files:
-                    cids = self._metadata.get_chunk_ids(f)
-                    if cids:
-                        batch_chunk_ids_map[f] = cids
-                self._vector_store.delete_by_files(batch_files, batch_chunk_ids_map)
-                self._bm25_store.remove_by_files(batch_files)
+                if _is_resume:
+                    # Clean up any partial data from a previously failed batch
+                    # so re-running is idempotent.
+                    batch_chunk_ids_map: dict[str, list[int]] = {}
+                    for f in batch_files:
+                        cids = self._metadata.get_chunk_ids(f)
+                        if cids:
+                            batch_chunk_ids_map[f] = cids
+                    self._vector_store.delete_by_files(batch_files, batch_chunk_ids_map)
+                    self._bm25_store.remove_by_files(batch_files)
 
                 batch_chunks = []
                 batch_file_map: list[tuple[str, int]] = []
@@ -637,6 +661,9 @@ class IndexPipeline:
                                     f"{type(retry_exc).__name__}: {retry_exc}"
                                 )
                                 print("Saving checkpoint before exit...")
+                                if _save_thread is not None:
+                                    _save_thread.join()
+                                    _save_thread = None
                                 self._bm25_store.save()
                                 self._metadata.save()
                                 print(
@@ -655,6 +682,9 @@ class IndexPipeline:
                                 "(driver timeout / TDR). "
                                 "Saving checkpoint — re-run to resume."
                             )
+                            if _save_thread is not None:
+                                _save_thread.join()
+                                _save_thread = None
                             self._bm25_store.save()
                             self._metadata.save()
                             print(
@@ -671,6 +701,9 @@ class IndexPipeline:
                             f"{type(exc).__name__}: {exc}"
                         )
                         print("Saving checkpoint before exit...")
+                        if _save_thread is not None:
+                            _save_thread.join()
+                            _save_thread = None
                         self._bm25_store.save()
                         self._metadata.save()
                         print(
@@ -679,6 +712,19 @@ class IndexPipeline:
                             f"Re-run to resume from batch {batch_num}."
                         )
                         raise
+
+                # Wait for previous metadata save before mutating stores.
+                # Placing the join BEFORE insert() keeps the crash window
+                # between insert() and set_chunk_ids() as narrow as possible
+                # (no disk I/O in between).
+                if _save_thread is not None:
+                    _save_thread.join()
+                    _save_thread = None
+                    if _save_error:
+                        raise RuntimeError(
+                            f"Metadata checkpoint save failed: {_save_error[0]}"
+                        )
+                    _save_error.clear()
 
                 chunk_ids = self._vector_store.insert(batch_chunks, embeddings)
                 chunks_created += len(chunk_ids)
@@ -691,20 +737,34 @@ class IndexPipeline:
                     self._metadata.set_chunk_ids(f, file_chunk_ids)
                     idx += n
 
-                # Persist checkpoint
-                self._bm25_store.save()
-                self._metadata.save()
+                # Persist metadata checkpoint in background so disk I/O
+                # overlaps with the next batch's embedding work.
+                # Errors are captured in _save_error and re-raised on the
+                # next join.
+                # BM25 is deferred to the end (pickles entire corpus, O(n²)
+                # if done per-batch; recoverable via Phase 3).
+                def _safe_save():
+                    try:
+                        self._metadata.save()
+                    except Exception as e:
+                        _save_error.append(e)
 
-                # Free GPU memory between batches to prevent fragmentation
+                _save_thread = threading.Thread(target=_safe_save, daemon=True)
+                _save_thread.start()
+
+                # Free GPU memory periodically to prevent fragmentation.
+                # Emptying the CUDA cache forces a device sync, so don't do it
+                # every batch — every 5th is enough.
                 del embeddings
-                gc.collect()
-                try:
-                    import torch
+                if batch_num % 5 == 0:
+                    gc.collect()
+                    try:
+                        import torch
 
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                except ImportError:
-                    pass
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except ImportError:
+                        pass
 
                 files_done += len(batch_files)
                 print(
@@ -712,6 +772,20 @@ class IndexPipeline:
                     f"({files_done}/{len(files_to_embed)} files, "
                     f"{chunks_created} chunks embedded so far)"
                 )
+
+            # Wait for the final metadata save to complete before BM25 save.
+            if _save_thread is not None:
+                _save_thread.join()
+                _save_thread = None
+                if _save_error:
+                    raise RuntimeError(
+                        f"Final metadata checkpoint save failed: {_save_error[0]}"
+                    )
+
+            # Save BM25 once at the end instead of every batch.  Each save
+            # pickles the full corpus, so per-batch saves are O(n²) I/O.
+            # If BM25 data is lost on crash, Phase 3 rebuilds it.
+            self._bm25_store.save()
 
         # == Phase 3: Rebuild BM25 for any indexed files missing from BM25 =====
         # This happens when BM25 store was corrupt/lost but ChromaDB + metadata

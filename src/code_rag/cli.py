@@ -280,8 +280,8 @@ def main(ctx: click.Context, update: bool) -> None:
     default=None,
     help=(
         "Embedding model to use for this index. "
-        "Defaults to Qwen/Qwen3-Embedding-0.6B. "
-        "Examples: BAAI/bge-large-en-v1.5, Qwen/Qwen3-Embedding-4B"
+        "Defaults to BAAI/bge-small-en-v1.5. "
+        "Examples: Qwen/Qwen3-Embedding-0.6B, Qwen/Qwen3-Embedding-4B"
     ),
 )
 def init(
