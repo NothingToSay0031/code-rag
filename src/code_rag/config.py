@@ -60,7 +60,8 @@ class CodeRagConfig:
     # ------------------------------------------------------------------
 
     def save(self) -> None:
-        """Persist model_name and device into ``<data_dir>/config.json``.
+        """Persist model_name, device and max_chunk_tokens into
+        ``<data_dir>/config.json``.
 
         Called by :class:`~code_rag.indexer.pipeline.IndexPipeline` after
         initialisation so the server can recreate the exact same embedder.
@@ -70,6 +71,7 @@ class CodeRagConfig:
         data = {
             "model_name": self.model_name,
             "device": self.device,
+            "max_chunk_tokens": self.max_chunk_tokens,
         }
         config_file.write_text(
             json.dumps(data, indent=2, ensure_ascii=False) + "\n",
@@ -91,6 +93,7 @@ class CodeRagConfig:
                     repo_path=repo_path,
                     model_name=data.get("model_name", "BAAI/bge-small-en-v1.5"),
                     device=data.get("device", "auto"),
+                    max_chunk_tokens=data.get("max_chunk_tokens", 4096),
                 )
             except Exception:
                 pass

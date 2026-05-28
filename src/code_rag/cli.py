@@ -220,17 +220,6 @@ def _load_last_repo() -> str | None:
     return None
 
 
-def _load_existing_model(repo: Path) -> str | None:
-    """Return the model_name from an existing ``.code-rag/config.json``, if any."""
-    config_file = repo / ".code-rag" / "config.json"
-    if config_file.exists():
-        try:
-            data = json.loads(config_file.read_text(encoding="utf-8"))
-            return data.get("model_name")
-        except Exception:
-            pass
-    return None
-
 
 @click.group(invoke_without_command=True)
 @click.version_option(version="0.1.0")
@@ -270,11 +259,6 @@ def main(ctx: click.Context, update: bool) -> None:
     help="Max tokens per chunk (default: 4096)",
 )
 @click.option(
-    "--data-dir",
-    default=None,
-    help="Index directory name (default: .code-rag). Use to keep multiple indices side-by-side.",
-)
-@click.option(
     "--model",
     "model_name",
     default=None,
@@ -290,7 +274,6 @@ def init(
     exclude_patterns: tuple,
     device: str,
     max_chunk_tokens: int | None,
-    data_dir: str | None,
     model_name: str | None,
 ):
     """Index a code repository for RAG search.
@@ -303,25 +286,25 @@ def init(
     repo = Path(repo_path)
     kwargs: dict = dict(
         repo_path=repo,
-        device=device,
         include_patterns=[p.replace("\\", "/") for p in include_patterns],
         exclude_patterns=[p.replace("\\", "/") for p in exclude_patterns],
     )
 
+    # Reuse existing index settings (model, chunk size, device)
+    # so re-indexing is consistent with the previous run.
+    existing = CodeRagConfig.load(repo)
+    if existing:
+        kwargs.setdefault("model_name", existing.model_name)
+        kwargs.setdefault("max_chunk_tokens", existing.max_chunk_tokens)
+        kwargs.setdefault("device", existing.device)
+
+    # CLI overrides take precedence
     if model_name:
         kwargs["model_name"] = model_name
-    else:
-        # Reuse the model from an existing index so re-indexing does not
-        # silently switch the embedding model (and produce dimension mismatches).
-        existing = _load_existing_model(repo)
-        if existing:
-            kwargs["model_name"] = existing
-
     if max_chunk_tokens is not None:
         kwargs["max_chunk_tokens"] = max_chunk_tokens
-
-    if data_dir is not None:
-        kwargs["data_dir"] = data_dir
+    if device != "auto":
+        kwargs["device"] = device
 
     config = CodeRagConfig(**kwargs)
 
