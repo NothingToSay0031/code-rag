@@ -56,7 +56,7 @@ class VectorStore:
         if self._available and self._collection.count() > 0:
             try:
                 sample = self._collection.get(limit=1, include=["embeddings"])
-                if sample and sample.get("embeddings") and sample["embeddings"]:
+                if sample and sample.get("embeddings") and len(sample["embeddings"]) > 0:
                     existing_dim = len(sample["embeddings"][0])
                     if existing_dim != dimension:
                         logger.error(
