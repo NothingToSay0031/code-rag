@@ -56,8 +56,9 @@ class VectorStore:
         if self._available and self._collection.count() > 0:
             try:
                 sample = self._collection.get(limit=1, include=["embeddings"])
-                if sample and sample.get("embeddings") and len(sample["embeddings"]) > 0:
-                    existing_dim = len(sample["embeddings"][0])
+                embeddings = sample.get("embeddings") if sample else None
+                if embeddings is not None and len(embeddings) > 0:
+                    existing_dim = len(np.asarray(embeddings[0]).ravel())
                     if existing_dim != dimension:
                         logger.error(
                             "VectorStore dimension mismatch: existing vectors have "
