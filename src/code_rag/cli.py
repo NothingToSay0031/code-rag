@@ -256,7 +256,7 @@ def main(ctx: click.Context, update: bool) -> None:
     "max_chunk_tokens",
     type=int,
     default=None,
-    help="Max tokens per chunk (default: 4096)",
+    help="Max tokens per chunk (default: 512)",
 )
 @click.option(
     "--model",

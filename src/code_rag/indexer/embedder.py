@@ -204,7 +204,7 @@ class Embedder:
             self._model.tokenizer.padding_side = "left"
         # Honour the caller's max_seq_length BUT never exceed what the
         # underlying transformer can actually handle (e.g. BERT's 512
-        # position embeddings).  config.max_chunk_tokens is 4096 for
+        # position embeddings).  config.max_chunk_tokens is 512 for
         # chunking; the embedder must cap it to the model's real limit
         # or the forward pass will crash with a tensor-size mismatch.
         # Try the loaded model's max_seq_length first to avoid a redundant
