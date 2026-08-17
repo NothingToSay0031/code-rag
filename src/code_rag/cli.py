@@ -208,48 +208,22 @@ def _git_pull_code_rag_repo() -> None:
 _SKILL_CONTENT = """\
 ---
 name: code-rag
-description: "Read a markdown spec/PRD/task file, then explore the codebase with code-rag to find relevant code. Starts a local query server so the model loads once, then queries on-demand."
+description: "Use when the user asks to explore or search a codebase — locating where a feature, function, or concept is implemented, understanding an unfamiliar repo, or mapping a spec, PRD, or task description to the relevant code."
 ---
 
-# RAG Explore
+# Explore the Codebase
 
-Read a user-provided markdown file (spec, PRD, task description, design doc), then
-use **code-rag** to explore the indexed codebase and find relevant code, patterns,
-and relationships.
+Read the user's request — a spec, PRD, task, or design doc in any format — then
+use **code-rag** to find the code behind it. A local HTTP query server holds the
+model in memory — start it once, then query on demand.
 
-## Architecture
-
-**Model loads ONCE.** A lightweight HTTP query server runs in the background
-with the embedding model loaded in memory. All queries reuse the same model
-instance. The server auto-shuts down after a configurable idle timeout
-(default 20 min; we recommend 10 min with `--idle-timeout 600`).
-
-**No MCP, no curl, no --port.** Query commands auto-discover the running server
-via `~/.code-rag/servers/`. Just run `code-rag search "..."` directly.
-
-## Platform Detection
-
-Before running any commands, detect your platform:
-
-- **Windows (PowerShell)**: Use `Start-Process -WindowStyle Hidden` to background
-  the server. Polling loops use `do { ... } while (...)`. Redirect with `2>&1`.
-- **macOS / Linux (bash/zsh)**: Use `&` to background the server.
-  Polling loops use `while ...; do ...; done`. Redirect with `2>/dev/null`.
-
-## 1. Ensure Server Is Running
-
-Always start by checking for a running server:
+## 1. Ensure the Server Is Running
 
 ```
 code-rag servers
 ```
 
-Example output:
-```
-  port=9020  repos=D:\\Code\\myproject  pid=12345  idle_timeout=600s
-```
-
-If a server is listed, skip to step 2. If "No running query servers found.", start one:
+If a row appears (`port=...`), continue to step 2. If not, start the server:
 
 **Windows (PowerShell):**
 ```powershell
@@ -261,53 +235,40 @@ Start-Process -WindowStyle Hidden -FilePath code-rag -ArgumentList "query-server
 code-rag query-server --idle-timeout 600 &
 ```
 
-Model loading takes 10-60 seconds (longer on CPU or first run). **Poll with a timeout:**
+Model loading takes 10-60 seconds. Poll until the server shows up (120s budget):
 
 **Windows:**
 ```powershell
-$timeout = 120; $elapsed = 0
-do {
-  Start-Sleep 3; $elapsed += 3
-  $r = (code-rag servers 2>&1 | Out-String).Trim()
-  if ($r -notmatch "No running") { Write-Output $r; break }
-  if ($elapsed -ge $timeout) {
-    Write-Error "Server failed to start after ${timeout}s. Check: is code-rag on PATH? Is the repo indexed?"
-    break
+$deadline = (Get-Date).AddSeconds(120)
+while ((code-rag servers 2>&1 | Out-String) -notmatch 'port=') {
+  if ((Get-Date) -gt $deadline) {
+    throw "Server failed to start. Is code-rag on PATH? Is the repo indexed?"
   }
-} while ($true)
+  Start-Sleep 3
+}
 ```
 
 **macOS / Linux:**
 ```bash
-timeout=120 elapsed=0
-while ! code-rag servers 2>/dev/null | grep -q "port="; do
-  sleep 3; elapsed=$((elapsed + 3))
-  if [ $elapsed -ge $timeout ]; then
-    echo "ERROR: Server failed to start after ${timeout}s." >&2
-    echo "Check: is code-rag on PATH? Is the repo indexed?" >&2
-    break
-  fi
+for i in $(seq 1 40); do
+  code-rag servers 2>/dev/null | grep -q "port=" && break
+  [ "$i" = 40 ] && { echo "Server failed to start. Is code-rag on PATH? Is the repo indexed?" >&2; exit 1; }
+  sleep 3
 done
-code-rag servers
 ```
 
-### Server Died Mid-Analysis?
+The server auto-shuts down after 600 idle seconds. During long analyses, run
+`code-rag health` (or any query) at least every 600s to keep it alive. If a
+query returns `"No query server found"`, the server died — restart from this
+step.
 
-If a query returns `"No query server found"`, the server timed out or crashed.
-Run `code-rag servers` to confirm, then restart using the commands above.
-The model must reload (~30-120s).
+## 2. Read the Request
 
-To prevent timeouts during long analysis: keep queries flowing at least every
-`<idle_timeout>` seconds. Run `code-rag health` periodically to reset the timer
-without producing noisy output.
-
-## 2. Read the Markdown
-
-Read the user's markdown file. Extract:
+Read the user's request in full. Extract:
 - **Key concepts**: domain terms, feature names, architectural patterns mentioned
 - **Entities**: classes, functions, modules, APIs referenced
 - **Relationships**: "X depends on Y", "Z implements W"
-- **Unknowns**: things the markdown says "see code" or "as implemented in"
+- **Unknowns**: phrases like "see code", "as implemented in"
 
 ## 3. Explore the Codebase
 
@@ -341,64 +302,20 @@ code-rag search "auth" --index sub1
 code-rag def LoginHandler --index root
 ```
 
-### Output Formats
+Stop exploring when every key concept from step 2 has a best-match location
+(file:line or symbol) or a confirmed gap.
 
-**`code-rag search`** returns ranked hits separated by `---`:
-```
----
-[1]  src/auth/login.py  L42-58  python  score=0.9234  symbol=login
-42: def login(request: Request) -> Response:
-43:     user = authenticate(request)
-...
-```
-
-**`code-rag symbols`** returns a symbol table:
-```
-src/auth/login.py  python  2048 bytes
-
-Symbols (8):
-  function  login  L42-58
-  function  logout  L60-65
-  class  AuthMiddleware  L70-120
-```
-
-**`code-rag def`** returns symbol definitions:
-```
----
-src/auth/login.py  L42-58  cpp
-Symbols: function login (L42-58)
-```
-
-**`code-rag read`** returns numbered lines:
-```
-src/auth/login.py  L38-45  (total: 80 lines)
-
-38: from typing import Optional
-39:
-40:
-41: @require_auth
-42: def login(request: Request) -> Response:
-```
-
-### Key Options
-- `code-rag search "..." --top-k 5 --language python --index root`
-- `code-rag def LoginHandler --include-code --include-refs --index root`
-- `code-rag read src/main.py --start 42 --end 80 --context 10`
-
-### Query Efficiency
 - Batch independent queries as parallel shell calls.
 - Don't re-search the same query — remember previous results.
-- Start with `--top-k 5` to see signal; expand to 10-15 if needed.
-- Use `--language` filter when the markdown is language-specific.
-- During long analysis (>5 min between queries), run `code-rag health` to reset
-  the idle timer and prevent the server from shutting down.
+- Start with `--top-k 5` to see signal; expand to 10-15 only if needed.
+- Add `--language` when the request is language-specific.
 
 ## 4. Synthesize Findings
 
 Present findings as a structured report:
 - **What you searched** — queries you ran and why
 - **What you found** — relevant files, symbols, patterns with line references
-- **Gaps** — things the markdown mentions that don't match any code
+- **Gaps** — request mentions with no matching code
 - **Suggestions** — surprising findings, potential issues, next steps
 
 ## Command Reference
@@ -410,7 +327,7 @@ Present findings as a structured report:
 | `code-rag stop [--port N] [--yes]` | Stop a server gracefully |
 | `code-rag indices` | List indexed repos |
 | `code-rag tree [path]` | `code-rag tree src/auth --depth 4` |
-| `code-rag search <query>` | `code-rag search "auth middleware" --top-k 5 --index root` |
+| `code-rag search <query>` | `code-rag search "auth middleware" --top-k 5 --language python --index root` |
 | `code-rag search-docs <query>` | `code-rag search-docs "API design"` |
 | `code-rag symbols <file>` | `code-rag symbols src/auth/login.py` |
 | `code-rag def <name>` | `code-rag def LoginHandler --include-code --include-refs --index root` |
