@@ -27,12 +27,45 @@ from code_rag.server import (
     _read_line_range,
     _render_refs,
     _find_references,
+    _path_within,
     _EXT_LANGUAGE_MAP,
     _guess_language,
     _Index,
 )
 
 _SERVER_DIR = Path.home() / ".code-rag" / "servers"
+
+
+def _get_int(
+    params: dict,
+    key: str,
+    default: int,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    """Parse an integer parameter, raising ValueError for invalid input."""
+    raw = params.get(key, default)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"Invalid value for '{key}': {raw!r} (expected an integer)"
+        ) from None
+    if minimum is not None and value < minimum:
+        raise ValueError(f"'{key}' must be >= {minimum} (got {value})")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"'{key}' must be <= {maximum} (got {value})")
+    return value
+
+
+def _get_bool(params: dict, key: str, default: bool) -> bool:
+    """Parse a boolean parameter, accepting JSON booleans and common strings."""
+    raw = params.get(key, default)
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    return bool(raw)
 
 
 class _ShutdownTimer:
@@ -42,23 +75,34 @@ class _ShutdownTimer:
         self._timeout = timeout_seconds
         self._port = port
         self._timer: threading.Timer | None = None
+        self._epoch = 0
         self._lock = threading.Lock()
 
     def reset(self):
+        if self._timeout <= 0:
+            return
         with self._lock:
+            self._epoch += 1
+            epoch = self._epoch
             if self._timer is not None:
                 self._timer.cancel()
-            self._timer = threading.Timer(self._timeout, self._shutdown)
+            self._timer = threading.Timer(self._timeout, self._shutdown, args=(epoch,))
             self._timer.daemon = True
             self._timer.start()
 
     def cancel(self):
         with self._lock:
+            self._epoch += 1
             if self._timer is not None:
                 self._timer.cancel()
                 self._timer = None
 
-    def _shutdown(self):
+    def _shutdown(self, epoch: int):
+        # A reset()/cancel() after this timer fired invalidates it (its epoch
+        # is stale) — the server is busy again, do not kill it.
+        with self._lock:
+            if epoch != self._epoch:
+                return
         print("[CodeRAG] Idle timeout reached — shutting down.", file=sys.stderr)
         try:
             state_file = _SERVER_DIR / f"{self._port}.json"
@@ -79,21 +123,39 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self._reset_timer()
-        if self.path == "/health":
-            self._reply_json({"status": "ok"})
-        elif self.path == "/list_indices":
-            self._handle_list_indices()
-        else:
-            self._reply_error(404, f"Not found: {self.path}")
+        try:
+            if self.path == "/health":
+                state = _get_state()
+                self._reply_json(
+                    {"status": "ok", "n_indices": len(state.get("indices", []))}
+                )
+            elif self.path == "/list_indices":
+                self._handle_list_indices()
+            else:
+                self._reply_error(404, f"Not found: {self.path}")
+        except ValueError as exc:
+            self._reply_error(400, str(exc))
+        except Exception as exc:
+            self._reply_error(500, f"Internal error: {exc}")
 
     def do_POST(self):
         self._reset_timer()
+        if self.headers.get("Transfer-Encoding"):
+            self._reply_error(400, "Transfer-Encoding not supported")
+            return
         try:
-            length = int(self.headers.get("Content-Length", "0"))
+            raw_len = self.headers.get("Content-Length", "0")
+            if not raw_len.isdigit():
+                self._reply_error(400, "Invalid Content-Length")
+                return
+            length = int(raw_len)
             body = self.rfile.read(length) if length else b"{}"
             params: dict[str, Any] = json.loads(body)
         except Exception:
             self._reply_error(400, "Invalid JSON body")
+            return
+        if not isinstance(params, dict):
+            self._reply_error(400, "JSON body must be an object")
             return
 
         routes = {
@@ -109,7 +171,12 @@ class _Handler(BaseHTTPRequestHandler):
         if handler is None:
             self._reply_error(404, f"Not found: {self.path}")
             return
-        handler(params)
+        try:
+            handler(params)
+        except ValueError as exc:
+            self._reply_error(400, str(exc))
+        except Exception as exc:
+            self._reply_error(500, f"Internal error: {exc}")
 
     def log_message(self, format, *args):
         """Suppress default access logs; we log to stderr manually."""
@@ -125,8 +192,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _handle_search_code(self, params: dict):
         query = params.get("query", "")
-        top_k = int(params.get("top_k", 8))
-        offset = int(params.get("offset", 0))
+        top_k = _get_int(params, "top_k", 8, minimum=1, maximum=200)
+        offset = _get_int(params, "offset", 0, minimum=0)
         language = params.get("language")
         index_name = params.get("index_name")
         exclude_paths = params.get("exclude_paths")
@@ -153,7 +220,7 @@ class _Handler(BaseHTTPRequestHandler):
                 "language": r.chunk.language,
                 "symbol_name": r.chunk.symbol_name,
                 "score": round(r.score, 4),
-                "snippet": _build_snippet(r, idx, top_k, rank),
+                "snippet": _build_snippet(r, idx, top_k, offset + rank + 1),
             }
             for rank, r in enumerate(results)
         ]
@@ -162,8 +229,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _handle_search_docs(self, params: dict):
         query = params.get("query", "")
-        top_k = int(params.get("top_k", 8))
-        offset = int(params.get("offset", 0))
+        top_k = _get_int(params, "top_k", 8, minimum=1, maximum=200)
+        offset = _get_int(params, "offset", 0, minimum=0)
         index_name = params.get("index_name")
         exclude_paths = params.get("exclude_paths")
 
@@ -187,7 +254,7 @@ class _Handler(BaseHTTPRequestHandler):
                 "start_line": r.chunk.start_line,
                 "end_line": r.chunk.end_line,
                 "score": round(r.score, 4),
-                "snippet": _build_snippet(r, idx, top_k, rank),
+                "snippet": _build_snippet(r, idx, top_k, offset + rank + 1),
             }
             for rank, r in enumerate(results)
         ]
@@ -215,6 +282,9 @@ class _Handler(BaseHTTPRequestHandler):
             content = abs_path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             content = abs_path.read_text(encoding="latin-1")
+        except OSError as exc:
+            self._reply_error(500, f"Could not read file: {exc}")
+            return
 
         symbols = idx.metadata.get_symbols(local_path)
         file_info = idx.metadata.get_file_info(local_path)
@@ -229,7 +299,7 @@ class _Handler(BaseHTTPRequestHandler):
         self._reply_json({"result": "\n".join(lines), "count": len(symbols)})
 
     def _handle_get_repo_structure(self, params: dict):
-        depth = int(params.get("depth", 3))
+        depth = _get_int(params, "depth", 3, minimum=1, maximum=50)
         path = params.get("path")
         index_name = params.get("index_name")
 
@@ -272,6 +342,9 @@ class _Handler(BaseHTTPRequestHandler):
                 if idx is None or target is None:
                     self._reply_error(404, f"Path not found: {path}")
                     return
+            if not _path_within(idx.repo_path, target):
+                self._reply_error(404, f"Path not found: {path}")
+                return
             if not target.exists():
                 self._reply_error(404, f"Path not found: {path}")
                 return
@@ -299,11 +372,11 @@ class _Handler(BaseHTTPRequestHandler):
     def _handle_get_symbol_info(self, params: dict):
         symbol_name = params.get("symbol_name", "")
         mode = params.get("mode", "grouped")
-        max_results = int(params.get("max_results", 20))
-        exact_match = bool(params.get("exact_match", True))
-        include_code = bool(params.get("include_code", False))
-        include_references = bool(params.get("include_references", False))
-        max_refs_per_symbol = int(params.get("max_refs_per_symbol", 30))
+        max_results = _get_int(params, "max_results", 20, minimum=1)
+        exact_match = _get_bool(params, "exact_match", True)
+        include_code = _get_bool(params, "include_code", False)
+        include_references = _get_bool(params, "include_references", False)
+        max_refs_per_symbol = _get_int(params, "max_refs_per_symbol", 30, minimum=1)
         index_name = params.get("index_name")
 
         state = _get_state()
@@ -316,18 +389,22 @@ class _Handler(BaseHTTPRequestHandler):
                 self._reply_error(400, str(exc))
                 return
 
+        # Mirror server.py get_symbol_info: Tier 0 Browse.VC.db, Tier 1
+        # MetadataStore, deduped via browse_seen so results match the MCP tool.
         raw_symbols: list[tuple[_Index, Any]] = []
         browse_db_extras = None
+        browse_seen: set[tuple[str, str, int]] = set()
         from code_rag.models import SymbolInfo
-        from code_rag.storage.browse_db import BrowseDBProvider
+        from code_rag.server import _normalize_cpp_path
 
         for idx in indices:
             if idx.browse_db and idx.browse_db.available:
                 db_results = idx.browse_db.find_symbol(symbol_name)
                 if db_results:
                     for item in db_results:
-                        from code_rag.server import _normalize_cpp_path
                         rel_path = _normalize_cpp_path(idx, item["file_path"])
+                        if not rel_path:
+                            continue  # outside the repo — never read it
                         raw_symbols.append(
                             (
                                 idx,
@@ -341,6 +418,9 @@ class _Handler(BaseHTTPRequestHandler):
                                 ),
                             )
                         )
+                        browse_seen.add(
+                            (rel_path.lower(), item["name"].lower(), item["start_line"])
+                        )
                     class_items = [i for i in db_results if i["kind_id"] in (1, 2, 5)]
                     if class_items:
                         bases = idx.browse_db.find_base_classes(symbol_name)
@@ -350,10 +430,14 @@ class _Handler(BaseHTTPRequestHandler):
                             if bases:
                                 browse_db_extras["base_classes"] = bases
                             if derived:
-                                browse_db_extras["derived_classes"] = [d["name"] for d in derived]
-                    continue
+                                browse_db_extras["derived_classes"] = [
+                                    d["name"] for d in derived
+                                ]
 
             for s in idx.metadata.find_symbol(symbol_name, exact_only=exact_match):
+                key = (s.file_path.lower(), s.name.lower(), s.start_line)
+                if key in browse_seen:
+                    continue
                 raw_symbols.append((idx, s))
 
         if mode == "declaration":
@@ -384,13 +468,26 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _handle_read_code(self, params: dict):
         file_path = params.get("file_path", "")
-        start_line = int(params.get("start_line", 1))
-        end_line = int(params.get("end_line", 1))
-        context_lines = int(params.get("context_lines", 0))
+        start_line = _get_int(params, "start_line", 1, minimum=1)
+        end_line = _get_int(params, "end_line", 1, minimum=1)
+        context_lines = _get_int(params, "context_lines", 0, minimum=0)
         index_name = params.get("index_name")
+
+        if start_line > end_line:
+            self._reply_error(
+                400, f"start_line ({start_line}) must be <= end_line ({end_line})"
+            )
+            return
 
         state = _get_state()
         indices = state["indices"]
+
+        if index_name is not None:
+            try:
+                indices = [_resolve_index(indices, index_name)]
+            except ValueError as exc:
+                self._reply_error(400, str(exc))
+                return
 
         resolved = _resolve_file(indices, file_path)
         if resolved is None:
@@ -469,12 +566,19 @@ class _Handler(BaseHTTPRequestHandler):
                     lines.append("")
                     lines.append(code)
             if include_references:
-                refs = _find_references(idx, s, max_refs=max_refs_per_symbol)
-                if refs:
-                    lines.append(f"\nReferences ({len(refs)}):")
-                    lines.append(_render_refs(refs))
+                refs, timed_out = _find_references(
+                    idx, s, max_refs=max_refs_per_symbol
+                )
+                if refs or timed_out:
+                    label = f"\nReferences ({len(refs)})"
+                    if timed_out:
+                        label += " — search timed out, results may be incomplete"
+                    lines.append(f"{label}:")
+                    if refs:
+                        lines.append(_render_refs(refs))
             count += 1
-        lines.append(_SEP)
+        if lines:
+            lines.append(_SEP)
         return "\n".join(lines) if lines else "(no results)"
 
     def _symbol_info_declaration(
@@ -497,12 +601,19 @@ class _Handler(BaseHTTPRequestHandler):
                     lines.append("")
                     lines.append(code)
             if include_references:
-                refs = _find_references(idx, s, max_refs=max_refs_per_symbol)
-                if refs:
-                    lines.append(f"\nReferences ({len(refs)}):")
-                    lines.append(_render_refs(refs))
+                refs, timed_out = _find_references(
+                    idx, s, max_refs=max_refs_per_symbol
+                )
+                if refs or timed_out:
+                    label = f"\nReferences ({len(refs)})"
+                    if timed_out:
+                        label += " — search timed out, results may be incomplete"
+                    lines.append(f"{label}:")
+                    if refs:
+                        lines.append(_render_refs(refs))
             count += 1
-        lines.append(_SEP)
+        if lines:
+            lines.append(_SEP)
         return "\n".join(lines) if lines else "(no results)"
 
     def _symbol_info_grouped(
@@ -560,12 +671,19 @@ class _Handler(BaseHTTPRequestHandler):
                     out_lines.append("")
                     out_lines.append(code)
                 if include_references:
-                    refs = _find_references(idx, range_syms[0], max_refs=max_refs_per_symbol)
-                    if refs:
-                        out_lines.append(f"\nReferences ({len(refs)}):")
-                        out_lines.append(_render_refs(refs))
+                    refs, timed_out = _find_references(
+                        idx, range_syms[0], max_refs=max_refs_per_symbol
+                    )
+                    if refs or timed_out:
+                        label = f"\nReferences ({len(refs)})"
+                        if timed_out:
+                            label += " — search timed out, results may be incomplete"
+                        out_lines.append(f"{label}:")
+                        if refs:
+                            out_lines.append(_render_refs(refs))
                 result_count += 1
-        out_lines.append(_SEP)
+        if out_lines:
+            out_lines.append(_SEP)
         return "\n".join(out_lines) if out_lines else "(no results)"
 
     # ------------------------------------------------------------------
@@ -604,23 +722,26 @@ def run_query_server(port: int, idle_timeout: int):
                 break
             chunks.append(chunk)
         probe.close()
-        resp = b"".join(chunks).decode("utf-8", errors="replace")
-        if '"status": "ok"' in resp or '"status":"ok"' in resp:
+        body = b"".join(chunks).partition(b"\r\n\r\n")[2]
+        try:
+            payload = json.loads(body.decode("utf-8", errors="replace"))
+        except Exception:
+            payload = None
+        if isinstance(payload, dict) and payload.get("status") == "ok":
             print(
                 f"[CodeRAG] Query server is already running on http://127.0.0.1:{port}",
                 file=sys.stderr,
             )
             sys.exit(0)
-        else:
-            print(
-                f"[CodeRAG] Port {port} is already in use by another process.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+        print(
+            f"[CodeRAG] Port {port} is already in use by another process.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     except (ConnectionRefusedError, socket.timeout, OSError):
         pass  # Port is free — proceed
 
-    print(f"[CodeRAG] Loading model and indices (this may take a moment)...", file=sys.stderr)
+    print("[CodeRAG] Loading model and indices (this may take a moment)...", file=sys.stderr)
     state = _get_state()
     n_indices = len(state.get("indices", []))
     if n_indices == 0:
@@ -630,7 +751,6 @@ def run_query_server(port: int, idle_timeout: int):
 
     timer = _ShutdownTimer(idle_timeout, port)
     _Handler.shutdown_timer = timer
-    timer.reset()
 
     try:
         server = ThreadingHTTPServer(("127.0.0.1", port), _Handler)
@@ -640,34 +760,23 @@ def run_query_server(port: int, idle_timeout: int):
             file=sys.stderr,
         )
         print(
-            f"[CodeRAG] The port may be in use. Try a different port with --port.",
+            "[CodeRAG] The port may be in use. Try a different port with --port.",
             file=sys.stderr,
         )
         sys.exit(1)
 
     def _sig_handler(signum, frame):
+        # HTTPServer.shutdown() must NOT be called from the thread running
+        # serve_forever() (it blocks until serve_forever exits) — the signal
+        # handler runs on that thread, so shut down from a worker thread.
         timer.cancel()
-        server.shutdown()
+        threading.Thread(target=server.shutdown, daemon=True).start()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, _sig_handler)
     signal.signal(signal.SIGTERM, _sig_handler)
 
     # ── Save state file for "code-rag servers" to discover ──
-    _SERVER_DIR.mkdir(parents=True, exist_ok=True)
-    state_file = _SERVER_DIR / f"{port}.json"
-    repo_raw = os.environ.get("CODE_RAG_REPO", os.getcwd())
-    repos = [r for r in repo_raw.split(os.pathsep) if r.strip()]
-    state_file.write_text(
-        json.dumps({
-            "pid": os.getpid(),
-            "port": port,
-            "repos": repos,
-            "idle_timeout": idle_timeout,
-        }),
-        encoding="utf-8",
-    )
-
     def _cleanup():
         try:
             state_file.unlink(missing_ok=True)
@@ -676,8 +785,28 @@ def run_query_server(port: int, idle_timeout: int):
 
     try:
         _Handler.server_instance = server
+        # Write the discovery state file only once we're actually serving, so
+        # a consumer probing in the startup window never sees a ghost entry.
+        _SERVER_DIR.mkdir(parents=True, exist_ok=True)
+        state_file = _SERVER_DIR / f"{port}.json"
+        repo_raw = os.environ.get("CODE_RAG_REPO", os.getcwd())
+        repos = [r for r in repo_raw.split(os.pathsep) if r.strip()]
+        state_file.write_text(
+            json.dumps({
+                "pid": os.getpid(),
+                "port": port,
+                "repos": repos,
+                "idle_timeout": idle_timeout,
+            }),
+            encoding="utf-8",
+        )
+        # Start the idle clock only once we're actually serving.
+        timer.reset()
         print(f"[CodeRAG] Query server listening on http://127.0.0.1:{port}", file=sys.stderr)
-        print(f"[CodeRAG] Auto-shutdown after {idle_timeout}s idle.", file=sys.stderr)
+        if idle_timeout > 0:
+            print(f"[CodeRAG] Auto-shutdown after {idle_timeout}s idle.", file=sys.stderr)
+        else:
+            print("[CodeRAG] Auto-shutdown disabled.", file=sys.stderr)
         server.serve_forever()
     finally:
         timer.cancel()

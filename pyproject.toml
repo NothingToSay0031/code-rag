@@ -9,7 +9,7 @@ description = "Local code repository RAG with MCP server"
 requires-python = ">=3.14"
 dependencies = [
     "fastmcp>=2.0",
-    "tree-sitter>=0.24",
+    "tree-sitter>=0.24,<0.26",
     "tree-sitter-python",
     "tree-sitter-javascript",
     "tree-sitter-typescript",

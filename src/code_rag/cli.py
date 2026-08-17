@@ -644,8 +644,12 @@ def serve(repo_path: str, transport: str, port: int):
     "--repo",
     "repo_paths",
     multiple=True,
-    default=["."],
-    help="Path to indexed repository (repeat for multiple repos)",
+    default=None,
+    help=(
+        "Path to indexed repository (repeat for multiple repos). "
+        "Falls back to CODE_RAG_REPO environment variable, then the "
+        "current directory."
+    ),
 )
 @click.option("--port", default=9020, type=int, help="HTTP server port (default: 9020)")
 @click.option(
@@ -668,8 +672,20 @@ def query_server(repo_paths: tuple, port: int, idle_timeout: int):
     """
     import os
 
+    repos: list[str] = []
+    # click's envvar support with multiple=True would split the value on
+    # whitespace, breaking Windows paths with spaces — read it manually.
+    if repo_paths:
+        for repo_path in repo_paths:
+            repos.extend(rp for rp in str(repo_path).split(os.pathsep) if rp)
+    else:
+        env_raw = os.environ.get("CODE_RAG_REPO", "")
+        repos = [r for r in env_raw.split(os.pathsep) if r]
+    if not repos:
+        repos = ["."]
+
     resolved_paths: list[str] = []
-    for repo_path in repo_paths:
+    for repo_path in repos:
         resolved = Path(repo_path).resolve()
         if repo_path == "." and not (resolved / ".code-rag").exists():
             sub_indices = list(resolved.rglob(".code-rag"))
@@ -691,8 +707,8 @@ def query_server(repo_paths: tuple, port: int, idle_timeout: int):
 
     from code_rag.query_server import run_query_server
 
-    click.echo(f"Starting CodeRAG query server...", err=True)
-    click.echo(f"Repository: {resolved}", err=True)
+    click.echo("Starting CodeRAG query server...", err=True)
+    click.echo(f"Repositories: {', '.join(resolved_paths)}", err=True)
     click.echo(f"Port: {port}", err=True)
     click.echo(f"Idle timeout: {idle_timeout}s", err=True)
 
@@ -815,9 +831,13 @@ def setup_skill(repo_path: str | None, force: bool):
     skill_dir = target_repo / ".opencode" / "skills" / "code-rag"
     skill_file = skill_dir / "SKILL.md"
 
-    if skill_file.exists() and not force:
-        click.echo(f"Skill already exists: {skill_file}")
-        click.echo("Use --force to overwrite.")
+    if not force:
+        written = _write_project_skill(target_repo)
+        if written is None:
+            click.echo(f"Skill already exists: {skill_file}")
+            click.echo("Use --force to overwrite.")
+        else:
+            click.echo(f"Skill written: {written}")
         return
 
     skill_dir.mkdir(parents=True, exist_ok=True)
@@ -882,8 +902,6 @@ def _discover_server_port() -> int | None:
         )
 
     return live_ports[0]
-
-    return None
 
 
 def _query(endpoint: str, data: dict | None = None, port: int | None = None) -> str:

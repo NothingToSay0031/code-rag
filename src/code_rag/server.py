@@ -125,25 +125,28 @@ def _get_state() -> dict:
         try:
             raw = os.environ.get("CODE_RAG_REPO", ".")
             roots = [Path(r).resolve() for r in raw.split(os.pathsep) if r.strip()]
+            multi_root = len(roots) > 1
 
             indices: list[_Index] = []
-            first = True
+            root_label: Path | None = None
 
             for root in roots:
                 data_dir = root / ".code-rag"
 
                 if data_dir.exists():
-                    indices.append(_build_index(root, prefix=""))
-                    if first:
-                        idx = indices[-1]
-                        print(
-                            f"[CodeRAG] Single index: {root}  model={idx.config.resolve_model_name()}",
-                            file=sys.stderr,
-                        )
-                        first = False
+                    # Directly indexed root: give it a name-based prefix in
+                    # multi-root mode so --index can target it unambiguously.
+                    prefix = root.name or "root" if multi_root else ""
+                    indices.append(_build_index(root, prefix=prefix))
+                    root_label = root_label or root
                 else:
                     sub_repos = _find_sub_indices(root)
                     if not sub_repos:
+                        print(
+                            f"[CodeRAG] Warning: no indexed repositories found "
+                            f"under {root} — skipping.",
+                            file=sys.stderr,
+                        )
                         continue
                     for repo_path in sub_repos:
                         try:
@@ -151,10 +154,8 @@ def _get_state() -> dict:
                         except ValueError:
                             prefix = repo_path.name
                         indices.append(_build_index(repo_path, prefix=prefix))
-                    if first and indices:
-                        info = [f"{idx.prefix}({idx.config.resolve_model_name()})" for idx in indices]
-                        print(f"[CodeRAG] Multi-index ({len(indices)} repos): {info}", file=sys.stderr)
-                        first = False
+                    if sub_repos:
+                        root_label = root_label or root
 
             if not indices:
                 raise RuntimeError(
@@ -162,12 +163,24 @@ def _get_state() -> dict:
                     f"Run 'code-rag init <repo_path>' first."
                 )
 
+            # Guarantee unique prefixes (root names may collide, and a sub-repo
+            # prefix may equal another root's name).
+            used: set[str] = set()
+            for idx in indices:
+                base = idx.prefix
+                if base in used:
+                    n = 2
+                    while f"{base}-{n}" in used:
+                        n += 1
+                    idx.prefix = f"{base}-{n}"
+                used.add(idx.prefix)
+
             info_parts = [f"{idx.prefix or idx.repo_path}({idx.config.resolve_model_name()})" for idx in indices]
             print(f"[CodeRAG] Loaded {len(indices)} index(es): {info_parts}", file=sys.stderr)
 
             _state.update(
                 {
-                    "root": roots[0],
+                    "root": root_label or roots[0],
                     "indices": indices,
                 }
             )
@@ -240,7 +253,10 @@ def _normalize_cpp_path(idx: "_Index", abs_path_str: str) -> str:
         try:
             rel = Path(abs_path_str).relative_to(idx.repo_path).as_posix()
         except ValueError:
-            return p  # leave as-is
+            # Outside the repo: returning it as-is would let include_code
+            # read files beyond the indexed repositories.  Callers skip
+            # empty paths.
+            return ""
 
     if not rel:
         return rel
@@ -265,17 +281,65 @@ def _normalize_cpp_path(idx: "_Index", abs_path_str: str) -> str:
     return rel
 
 
+def _is_safe_rel_path(qualified_path: str) -> bool:
+    """True if a user-supplied repo-relative path stays inside the repo.
+
+    Rejects absolute, rooted, drive-qualified, and parent-directory paths.
+    """
+    if os.path.isabs(qualified_path):
+        return False
+    drive, tail = os.path.splitdrive(qualified_path)
+    if drive or tail.startswith(("/", "\\")):
+        return False
+    norm = os.path.normpath(qualified_path)
+    if norm == os.pardir or norm.startswith(os.pardir + os.sep):
+        return False
+    return True
+
+
+def _path_within(root: Path, target: Path) -> bool:
+    """True if *target* lies inside *root* (lexical, no symlink resolution)."""
+    norm_root = os.path.normpath(os.path.abspath(root))
+    norm_target = os.path.normpath(os.path.abspath(target))
+    try:
+        Path(norm_target).relative_to(Path(norm_root))
+    except ValueError:
+        return False
+    return True
+
+
 def _resolve_file(
     indices: list[_Index], qualified_path: str
 ) -> tuple[_Index, str] | None:
     """Given a qualified path, find the owning index and the local file path."""
+    if not _is_safe_rel_path(qualified_path):
+        return None
+
+    # Normalize separators for prefix matching (Windows clients often send
+    # backslashes; index prefixes are always forward-slash).
+    if os.name == "nt":
+        qualified_path = qualified_path.replace("\\", "/")
+
     for idx in indices:
         if not idx.prefix:
             # Single-index mode — path is already local
             return idx, qualified_path
+
+    # Multi-index mode: match the LONGEST prefix so nested prefixes like
+    # "a" and "a/b" resolve to the deeper index.
+    best: tuple[_Index, str] | None = None
+    for idx in indices:
+        if not idx.prefix:
+            continue
         if qualified_path.startswith(idx.prefix + "/"):
             local = qualified_path[len(idx.prefix) + 1 :]
-            return idx, local
+            if not _is_safe_rel_path(local):
+                continue
+            if best is None or len(idx.prefix) > len(best[0].prefix):
+                best = (idx, local)
+    if best is not None:
+        return best
+
     # Fallback: try each index directly (path might already be local)
     for idx in indices:
         abs_path = idx.repo_path / qualified_path
@@ -687,11 +751,15 @@ def get_file_symbols(file_path: str) -> str:
     abs_path = idx.repo_path / local_path
     if not abs_path.exists():
         return f"error: File not found: {file_path}"
+    if abs_path.is_dir():
+        return f"error: Not a file: {file_path}"
 
     try:
         content = abs_path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
         content = abs_path.read_text(encoding="latin-1")
+    except OSError as exc:
+        return f"error: Could not read file: {exc}"
 
     symbols = idx.metadata.get_symbols(local_path)
     file_info = idx.metadata.get_file_info(local_path)
@@ -762,6 +830,8 @@ def get_repo_structure(
             if idx is None or target is None:
                 return f"error: Path not found: {path}. Call list_indices() to see available repos."
 
+        if not _path_within(idx.repo_path, target):
+            return f"error: Path not found: {path}"
         if not target.exists():
             return f"error: Path not found: {path}"
         if not target.is_dir():
@@ -950,6 +1020,8 @@ def get_symbol_info(
                     # Convert absolute path to relative AND restore actual
                     # filesystem case (Browse.VC.db stores upper-cased paths).
                     rel_path = _normalize_cpp_path(idx, item["file_path"])
+                    if not rel_path:
+                        continue  # outside the repo — never read it
                     raw_symbols.append(
                         (
                             idx,
