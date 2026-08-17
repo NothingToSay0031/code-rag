@@ -123,39 +123,51 @@ def _get_state() -> dict:
             return _state
         _state["_initializing"] = True
         try:
-            root = Path(os.environ.get("CODE_RAG_REPO", ".")).resolve()
-            data_dir = root / ".code-rag"
+            raw = os.environ.get("CODE_RAG_REPO", ".")
+            roots = [Path(r).resolve() for r in raw.split(os.pathsep) if r.strip()]
 
             indices: list[_Index] = []
+            first = True
 
-            if data_dir.exists():
-                # Single-index: CWD itself is an indexed repo
-                indices.append(_build_index(root, prefix=""))
-                idx = indices[0]
-                print(
-                    f"[CodeRAG] Single index: {root}  model={idx.config.resolve_model_name()}",
-                    file=sys.stderr,
+            for root in roots:
+                data_dir = root / ".code-rag"
+
+                if data_dir.exists():
+                    indices.append(_build_index(root, prefix=""))
+                    if first:
+                        idx = indices[-1]
+                        print(
+                            f"[CodeRAG] Single index: {root}  model={idx.config.resolve_model_name()}",
+                            file=sys.stderr,
+                        )
+                        first = False
+                else:
+                    sub_repos = _find_sub_indices(root)
+                    if not sub_repos:
+                        continue
+                    for repo_path in sub_repos:
+                        try:
+                            prefix = repo_path.relative_to(root).as_posix()
+                        except ValueError:
+                            prefix = repo_path.name
+                        indices.append(_build_index(repo_path, prefix=prefix))
+                    if first and indices:
+                        info = [f"{idx.prefix}({idx.config.resolve_model_name()})" for idx in indices]
+                        print(f"[CodeRAG] Multi-index ({len(indices)} repos): {info}", file=sys.stderr)
+                        first = False
+
+            if not indices:
+                raise RuntimeError(
+                    f"No indexed repositories found under {raw}.\n"
+                    f"Run 'code-rag init <repo_path>' first."
                 )
-            else:
-                # Multi-index: scan subdirectories
-                sub_repos = _find_sub_indices(root)
-                if not sub_repos:
-                    raise RuntimeError(
-                        f"No indexed repositories found under {root}.\n"
-                        f"Run 'code-rag init <repo_path>' first."
-                    )
-                for repo_path in sub_repos:
-                    try:
-                        prefix = repo_path.relative_to(root).as_posix()
-                    except ValueError:
-                        prefix = repo_path.name
-                    indices.append(_build_index(repo_path, prefix=prefix))
-                info = [f"{idx.prefix}({idx.config.resolve_model_name()})" for idx in indices]
-                print(f"[CodeRAG] Multi-index ({len(indices)} repos): {info}", file=sys.stderr)
+
+            info_parts = [f"{idx.prefix or idx.repo_path}({idx.config.resolve_model_name()})" for idx in indices]
+            print(f"[CodeRAG] Loaded {len(indices)} index(es): {info_parts}", file=sys.stderr)
 
             _state.update(
                 {
-                    "root": root,
+                    "root": roots[0],
                     "indices": indices,
                 }
             )
@@ -232,6 +244,9 @@ def _normalize_cpp_path(idx: "_Index", abs_path_str: str) -> str:
 
     if not rel:
         return rel
+
+    if idx._path_case_map is None:
+        idx._path_case_map = {f.lower(): f for f in idx.metadata.get_all_files()}
 
     result = idx._path_case_map.get(rel.lower())
     if result is not None:

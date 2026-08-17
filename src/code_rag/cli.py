@@ -205,6 +205,239 @@ def _git_pull_code_rag_repo() -> None:
         raise click.ClickException(f"git pull failed (exit {exc.returncode}).") from exc
 
 
+_SKILL_CONTENT = """\
+---
+name: code-rag
+description: "Read a markdown spec/PRD/task file, then explore the codebase with code-rag to find relevant code. Starts a local query server so the model loads once, then queries on-demand."
+---
+
+# RAG Explore
+
+Read a user-provided markdown file (spec, PRD, task description, design doc), then
+use **code-rag** to explore the indexed codebase and find relevant code, patterns,
+and relationships.
+
+## Architecture
+
+**Model loads ONCE.** A lightweight HTTP query server runs in the background
+with the embedding model loaded in memory. All queries reuse the same model
+instance. The server auto-shuts down after a configurable idle timeout
+(default 20 min; we recommend 10 min with `--idle-timeout 600`).
+
+**No MCP, no curl, no --port.** Query commands auto-discover the running server
+via `~/.code-rag/servers/`. Just run `code-rag search "..."` directly.
+
+## Platform Detection
+
+Before running any commands, detect your platform:
+
+- **Windows (PowerShell)**: Use `Start-Process -WindowStyle Hidden` to background
+  the server. Polling loops use `do { ... } while (...)`. Redirect with `2>&1`.
+- **macOS / Linux (bash/zsh)**: Use `&` to background the server.
+  Polling loops use `while ...; do ...; done`. Redirect with `2>/dev/null`.
+
+## 1. Ensure Server Is Running
+
+Always start by checking for a running server:
+
+```
+code-rag servers
+```
+
+Example output:
+```
+  port=9020  repos=D:\\Code\\myproject  pid=12345  idle_timeout=600s
+```
+
+If a server is listed, skip to step 2. If "No running query servers found.", start one:
+
+**Windows (PowerShell):**
+```powershell
+Start-Process -WindowStyle Hidden -FilePath code-rag -ArgumentList "query-server","--idle-timeout","600"
+```
+
+**macOS / Linux:**
+```bash
+code-rag query-server --idle-timeout 600 &
+```
+
+Model loading takes 10-60 seconds (longer on CPU or first run). **Poll with a timeout:**
+
+**Windows:**
+```powershell
+$timeout = 120; $elapsed = 0
+do {
+  Start-Sleep 3; $elapsed += 3
+  $r = (code-rag servers 2>&1 | Out-String).Trim()
+  if ($r -notmatch "No running") { Write-Output $r; break }
+  if ($elapsed -ge $timeout) {
+    Write-Error "Server failed to start after ${timeout}s. Check: is code-rag on PATH? Is the repo indexed?"
+    break
+  }
+} while ($true)
+```
+
+**macOS / Linux:**
+```bash
+timeout=120 elapsed=0
+while ! code-rag servers 2>/dev/null | grep -q "port="; do
+  sleep 3; elapsed=$((elapsed + 3))
+  if [ $elapsed -ge $timeout ]; then
+    echo "ERROR: Server failed to start after ${timeout}s." >&2
+    echo "Check: is code-rag on PATH? Is the repo indexed?" >&2
+    break
+  fi
+done
+code-rag servers
+```
+
+### Server Died Mid-Analysis?
+
+If a query returns `"No query server found"`, the server timed out or crashed.
+Run `code-rag servers` to confirm, then restart using the commands above.
+The model must reload (~30-120s).
+
+To prevent timeouts during long analysis: keep queries flowing at least every
+`<idle_timeout>` seconds. Run `code-rag health` periodically to reset the timer
+without producing noisy output.
+
+## 2. Read the Markdown
+
+Read the user's markdown file. Extract:
+- **Key concepts**: domain terms, feature names, architectural patterns mentioned
+- **Entities**: classes, functions, modules, APIs referenced
+- **Relationships**: "X depends on Y", "Z implements W"
+- **Unknowns**: things the markdown says "see code" or "as implemented in"
+
+## 3. Explore the Codebase
+
+Commands auto-discover the server. If multiple servers are running,
+**`code-rag servers` will show a warning and list them** — use `--port N`
+to target a specific one.
+
+Always start broad, then narrow:
+
+| Step | Command | Purpose |
+|------|---------|---------|
+| 1 | `code-rag indices` | See which repos are indexed |
+| 2 | `code-rag tree [path]` | Understand project layout |
+| 3 | `code-rag search "concept"` | Broad concept/behavior search |
+| 4 | `code-rag search-docs "concept"` | Search markdown/rst/doc files |
+| 5 | `code-rag symbols <file>` | Inspect a file's functions/classes |
+| 6 | `code-rag def <Name>` | Look up exact identifier definition |
+| 7 | `code-rag read <file> --start N --end N` | Expand snippets to full context |
+
+### Multi-Repository Indexes
+
+`code-rag indices` shows each index as:
+```
+(root)  D:\\Code\\myproject  model=Qwen/...  (23343 files)
+(sub1)  D:\\Code\\other      model=Qwen/...  (1240 files)
+```
+
+Use the prefix in parentheses with `--index` to scope queries:
+```
+code-rag search "auth" --index sub1
+code-rag def LoginHandler --index root
+```
+
+### Output Formats
+
+**`code-rag search`** returns ranked hits separated by `---`:
+```
+---
+[1]  src/auth/login.py  L42-58  python  score=0.9234  symbol=login
+42: def login(request: Request) -> Response:
+43:     user = authenticate(request)
+...
+```
+
+**`code-rag symbols`** returns a symbol table:
+```
+src/auth/login.py  python  2048 bytes
+
+Symbols (8):
+  function  login  L42-58
+  function  logout  L60-65
+  class  AuthMiddleware  L70-120
+```
+
+**`code-rag def`** returns symbol definitions:
+```
+---
+src/auth/login.py  L42-58  cpp
+Symbols: function login (L42-58)
+```
+
+**`code-rag read`** returns numbered lines:
+```
+src/auth/login.py  L38-45  (total: 80 lines)
+
+38: from typing import Optional
+39:
+40:
+41: @require_auth
+42: def login(request: Request) -> Response:
+```
+
+### Key Options
+- `code-rag search "..." --top-k 5 --language python --index root`
+- `code-rag def LoginHandler --include-code --include-refs --index root`
+- `code-rag read src/main.py --start 42 --end 80 --context 10`
+
+### Query Efficiency
+- Batch independent queries as parallel shell calls.
+- Don't re-search the same query — remember previous results.
+- Start with `--top-k 5` to see signal; expand to 10-15 if needed.
+- Use `--language` filter when the markdown is language-specific.
+- During long analysis (>5 min between queries), run `code-rag health` to reset
+  the idle timer and prevent the server from shutting down.
+
+## 4. Synthesize Findings
+
+Present findings as a structured report:
+- **What you searched** — queries you ran and why
+- **What you found** — relevant files, symbols, patterns with line references
+- **Gaps** — things the markdown mentions that don't match any code
+- **Suggestions** — surprising findings, potential issues, next steps
+
+## Command Reference
+
+| Command | Example |
+|---------|---------|
+| `code-rag servers` | List running servers (check this first) |
+| `code-rag health` | Quick alive check (for scripts/keepalive) |
+| `code-rag stop [--port N] [--yes]` | Stop a server gracefully |
+| `code-rag indices` | List indexed repos |
+| `code-rag tree [path]` | `code-rag tree src/auth --depth 4` |
+| `code-rag search <query>` | `code-rag search "auth middleware" --top-k 5 --index root` |
+| `code-rag search-docs <query>` | `code-rag search-docs "API design"` |
+| `code-rag symbols <file>` | `code-rag symbols src/auth/login.py` |
+| `code-rag def <name>` | `code-rag def LoginHandler --include-code --include-refs --index root` |
+| `code-rag read <file> --start N --end N` | `code-rag read src/main.py --start 42 --end 80 --context 5` |
+
+## Prerequisites
+
+- A repo indexed with `code-rag init <repo_path>`
+- The `code-rag` CLI installed and on PATH
+
+"""
+
+
+def _write_project_skill(repo_path: Path) -> Path | None:
+    """Write the code-rag skill to the project's .opencode/skills/ directory.
+
+    Returns the path to the written SKILL.md, or None if it already exists.
+    """
+    skill_dir = repo_path / ".opencode" / "skills" / "code-rag"
+    skill_file = skill_dir / "SKILL.md"
+    if skill_file.exists():
+        return None
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    skill_file.write_text(_SKILL_CONTENT, encoding="utf-8")
+    return skill_file
+
+
 def _save_last_repo(repo_path: str):
     _CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
     _CONFIG_FILE.write_text(json.dumps({"repo_path": repo_path}), encoding="utf-8")
@@ -325,18 +558,12 @@ def init(
     click.echo(f"  Files skipped: {stats.files_skipped}")
     click.echo(f"  Time: {stats.elapsed_seconds:.1f}s")
 
-    # Write project-level MCP configs so AI clients only see this MCP
-    # when the repo is open (instead of a global always-on config).
-    exe = _detect_executable()
-    written = _write_project_mcp_configs(resolved_repo, executable=exe)
-    if written:
-        click.echo("\nProject-level MCP configs written:")
-        for p in written:
-            click.echo(f"  {p}")
-        click.echo(
-            "\nTip: remove the global 'code-rag' MCP entry from your AI client's\n"
-            "     global config so the MCP is only active in indexed projects."
-        )
+    # Write project-level code-rag skill (default and recommended).
+    # MCP is available via 'code-rag setup-mcp' for users who need it.
+    skill_file = _write_project_skill(resolved_repo)
+    if skill_file:
+        click.echo(f"\nProject-level skill written: {skill_file}")
+        click.echo("  The AI can now use the 'code-rag' skill in this project.")
 
 
 @main.command()
@@ -410,6 +637,66 @@ def serve(repo_path: str, transport: str, port: int):
         mcp.run(transport="stdio")
     else:
         mcp.run(transport="sse", port=port)
+
+
+@main.command("query-server")
+@click.option(
+    "--repo",
+    "repo_paths",
+    multiple=True,
+    default=["."],
+    help="Path to indexed repository (repeat for multiple repos)",
+)
+@click.option("--port", default=9020, type=int, help="HTTP server port (default: 9020)")
+@click.option(
+    "--idle-timeout",
+    default=1200,
+    type=int,
+    help="Auto-shutdown after N seconds of inactivity (default: 1200 = 20 min). 0 to disable.",
+)
+def query_server(repo_paths: tuple, port: int, idle_timeout: int):
+    """Start a lightweight HTTP query server for code-rag.
+
+    Loads the model and indices once, then accepts JSON queries via HTTP POST.
+    Designed as a local daemon for AI skills/tools — no MCP transport needed.
+
+    Auto-shuts down after IDLE_TIMEOUT seconds of inactivity (default 20 min).
+    Set --idle-timeout=0 to disable auto-shutdown.
+
+    Pass --repo multiple times to serve multiple independent repositories
+    from a single server instance.
+    """
+    import os
+
+    resolved_paths: list[str] = []
+    for repo_path in repo_paths:
+        resolved = Path(repo_path).resolve()
+        if repo_path == "." and not (resolved / ".code-rag").exists():
+            sub_indices = list(resolved.rglob(".code-rag"))
+            if not sub_indices:
+                saved = _load_last_repo()
+                if saved:
+                    saved_path = Path(saved)
+                    has_root_index = (saved_path / ".code-rag").exists()
+                    has_sub_indices = (
+                        not has_root_index
+                        and saved_path.is_dir()
+                        and any(saved_path.rglob(".code-rag"))
+                    )
+                    if has_root_index or has_sub_indices:
+                        resolved = saved_path
+        resolved_paths.append(str(resolved))
+
+    os.environ["CODE_RAG_REPO"] = os.pathsep.join(resolved_paths)
+
+    from code_rag.query_server import run_query_server
+
+    click.echo(f"Starting CodeRAG query server...", err=True)
+    click.echo(f"Repository: {resolved}", err=True)
+    click.echo(f"Port: {port}", err=True)
+    click.echo(f"Idle timeout: {idle_timeout}s", err=True)
+
+    run_query_server(port=port, idle_timeout=idle_timeout)
 
 
 @main.command("setup-mcp")
@@ -502,3 +789,418 @@ def _setup_global_mcp(executable: str, clients: list[str]) -> None:
                 continue
             _merge_json_file(gpath, update)
             click.echo(f"  [{client}] {gpath}")
+
+
+@main.command("setup-skill")
+@click.option(
+    "--repo",
+    "repo_path",
+    default=None,
+    help="Repository path to write the skill to (default: current directory)",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Overwrite existing skill file",
+)
+def setup_skill(repo_path: str | None, force: bool):
+    """Write the code-rag skill to a project's .opencode/skills/ directory.
+
+    This enables the AI to explore code with code-rag using a local
+    HTTP query server (no MCP required).
+    """
+    target_repo = Path(repo_path).resolve() if repo_path else Path.cwd()
+
+    skill_dir = target_repo / ".opencode" / "skills" / "code-rag"
+    skill_file = skill_dir / "SKILL.md"
+
+    if skill_file.exists() and not force:
+        click.echo(f"Skill already exists: {skill_file}")
+        click.echo("Use --force to overwrite.")
+        return
+
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    skill_file.write_text(_SKILL_CONTENT, encoding="utf-8")
+    click.echo(f"Skill written: {skill_file}")
+
+
+# ---------------------------------------------------------------------------
+# Query client helpers
+# ---------------------------------------------------------------------------
+
+import urllib.request
+import urllib.error
+
+
+def _discover_server_port() -> int | None:
+    """Find the port of a running query server by scanning state files.
+
+    Scans all state files, collects live servers, then warns to stderr
+    if multiple are found and returns the first one's port.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    server_dir = _Path.home() / ".code-rag" / "servers"
+    if not server_dir.exists():
+        return None
+
+    live_ports: list[int] = []
+    for f in sorted(server_dir.glob("*.json")):
+        try:
+            info = _json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            f.unlink(missing_ok=True)
+            continue
+        port = info.get("port")
+        if not port:
+            f.unlink(missing_ok=True)
+            continue
+
+        try:
+            url = f"http://127.0.0.1:{port}/health"
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                body = _json.loads(resp.read().decode("utf-8"))
+                if body.get("status") == "ok":
+                    live_ports.append(port)
+                else:
+                    f.unlink(missing_ok=True)
+        except Exception:
+            f.unlink(missing_ok=True)
+
+    if not live_ports:
+        return None
+
+    if len(live_ports) > 1:
+        import sys
+        print(
+            f"Warning: {len(live_ports)} query servers running (ports: {live_ports}). "
+            f"Using port {live_ports[0]}. Use --port to pick a specific one.",
+            file=sys.stderr,
+        )
+
+    return live_ports[0]
+
+    return None
+
+
+def _query(endpoint: str, data: dict | None = None, port: int | None = None) -> str:
+    """Send a request to the query server and return the response body.
+
+    If *port* is None, auto-discovers the first running query server.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    if port is None:
+        port = _discover_server_port()
+
+    if port is None:
+        raise click.ClickException(
+            "No query server found. Start it first: code-rag query-server"
+        )
+    url = f"http://127.0.0.1:{port}{endpoint}"
+    try:
+        if data is not None:
+            body = json.dumps(data).encode("utf-8")
+            req = urllib.request.Request(
+                url, data=body, headers={"Content-Type": "application/json"}
+            )
+        else:
+            req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        try:
+            err = json.loads(body)
+            msg = err.get("error", body)
+        except Exception:
+            msg = body
+        raise click.ClickException(f"Server error: {msg}")
+    except urllib.error.URLError:
+        raise click.ClickException(
+            f"No query server found at http://127.0.0.1:{port}.\n"
+            f"Start it first: code-rag query-server"
+        )
+
+    if isinstance(result, dict) and "error" in result:
+        raise click.ClickException(result["error"])
+    return result.get("result", "")
+
+
+# ---------------------------------------------------------------------------
+# Query commands (talk to a running query server)
+# ---------------------------------------------------------------------------
+
+
+@main.command("search")
+@click.argument("query")
+@click.option("--top-k", type=int, default=8, help="Number of results (default: 8)")
+@click.option("--offset", type=int, default=0, help="Pagination offset")
+@click.option("--language", default=None, help="Language filter (e.g. python, cpp)")
+@click.option("--index", "index_name", default=None, help="Index name (for multi-repo servers)")
+@click.option("--port", default=None, type=int, help="Query server port (auto-detected)")
+def search_cmd(query: str, top_k: int, offset: int, language: str | None, index_name: str | None, port: int | None):
+    """Search code with a natural language query."""
+    data: dict = {"query": query, "top_k": top_k, "offset": offset, "language": language}
+    if index_name:
+        data["index_name"] = index_name
+    result = _query("/search_code", data, port=port)
+    click.echo(result)
+
+
+@main.command("search-docs")
+@click.argument("query")
+@click.option("--top-k", type=int, default=8, help="Number of results (default: 8)")
+@click.option("--offset", type=int, default=0, help="Pagination offset")
+@click.option("--port", default=None, type=int, help="Query server port (auto-detected)")
+def search_docs_cmd(query: str, top_k: int, offset: int, port: int | None):
+    """Search documentation files."""
+    result = _query(
+        "/search_docs",
+        {"query": query, "top_k": top_k, "offset": offset},
+        port=port,
+    )
+    click.echo(result)
+
+
+@main.command("symbols")
+@click.argument("file_path")
+@click.option("--port", default=None, type=int, help="Query server port (auto-detected)")
+def symbols_cmd(file_path: str, port: int | None):
+    """List symbols (functions, classes) in a file."""
+    result = _query("/get_file_symbols", {"file_path": file_path}, port=port)
+    click.echo(result)
+
+
+@main.command("def")
+@click.argument("name")
+@click.option("--include-code", is_flag=True, help="Include source code")
+@click.option("--include-refs", is_flag=True, help="Include references/call sites")
+@click.option("--max-results", type=int, default=20, help="Max results (default: 20)")
+@click.option("--index", "index_name", default=None, help="Index name (for multi-repo servers)")
+@click.option("--port", default=None, type=int, help="Query server port (auto-detected)")
+def def_cmd(name: str, include_code: bool, include_refs: bool, max_results: int, index_name: str | None, port: int | None):
+    """Look up a symbol definition by name."""
+    data: dict = {
+        "symbol_name": name,
+        "include_code": include_code,
+        "include_references": include_refs,
+        "max_results": max_results,
+    }
+    if index_name:
+        data["index_name"] = index_name
+    result = _query("/get_symbol_info", data, port=port)
+    click.echo(result)
+
+
+@main.command("read")
+@click.argument("file_path")
+@click.option("--start", type=int, required=True, help="Start line (1-based, inclusive)")
+@click.option("--end", type=int, required=True, help="End line (1-based, inclusive)")
+@click.option("--context", type=int, default=0, help="Extra context lines")
+@click.option("--port", default=None, type=int, help="Query server port (auto-detected)")
+def read_cmd(file_path: str, start: int, end: int, context: int, port: int | None):
+    """Read a line range from a source file."""
+    result = _query(
+        "/read_code",
+        {
+            "file_path": file_path,
+            "start_line": start,
+            "end_line": end,
+            "context_lines": context,
+        },
+        port=port,
+    )
+    click.echo(result)
+
+
+@main.command("tree")
+@click.argument("path", required=False, default=None)
+@click.option("--depth", type=int, default=4, help="Max tree depth (default: 4)")
+@click.option("--port", default=None, type=int, help="Query server port (auto-detected)")
+def tree_cmd(path: str | None, depth: int, port: int | None):
+    """Show directory tree of indexed files."""
+    data: dict = {"depth": depth}
+    if path:
+        data["path"] = path
+    result = _query("/get_repo_structure", data, port=port)
+    click.echo(result)
+
+
+@main.command("indices")
+@click.option("--port", default=None, type=int, help="Query server port (auto-detected)")
+def indices_cmd(port: int | None):
+    """List available code indices (repositories)."""
+    result = _query("/list_indices", port=port)
+    click.echo(result)
+
+
+@main.command("servers")
+def servers_cmd():
+    """List running code-rag query servers."""
+    import json
+    import urllib.error
+    from pathlib import Path
+
+    server_dir = Path.home() / ".code-rag" / "servers"
+    if not server_dir.exists():
+        click.echo("No query servers found.")
+        return
+
+    found = False
+    for f in sorted(server_dir.glob("*.json")):
+        try:
+            info = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        port = info.get("port", 0)
+        pid = info.get("pid", "?")
+        timeout = info.get("idle_timeout", "?")
+        repos = info.get("repos", [info.get("repo", "?")])
+        repos_str = ", ".join(repos) if isinstance(repos, list) else str(repos)
+
+        # Check if actually alive
+        alive = False
+        try:
+            url = f"http://127.0.0.1:{port}/health"
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+                alive = body.get("status") == "ok"
+        except Exception:
+            alive = False
+
+        if not alive:
+            f.unlink(missing_ok=True)
+            continue
+
+        found = True
+        click.echo(f"  port={port}  repos={repos_str}  pid={pid}  idle_timeout={timeout}s")
+
+    if not found:
+        click.echo("No running query servers found.")
+
+
+@main.command("stop")
+@click.option("--port", type=int, default=None, help="Port of the server to stop (auto-detect if only one)")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt")
+def stop_cmd(port: int | None, yes: bool):
+    """Stop a running code-rag query server gracefully."""
+    import json
+    import urllib.error
+    import urllib.request
+    from pathlib import Path
+
+    server_dir = Path.home() / ".code-rag" / "servers"
+    if not server_dir.exists():
+        click.echo("No query servers found.")
+        return
+
+    # Find alive servers
+    alive_servers: list[dict] = []
+    for f in sorted(server_dir.glob("*.json")):
+        try:
+            info = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        p = info.get("port", 0)
+        try:
+            url = f"http://127.0.0.1:{p}/health"
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+                if body.get("status") == "ok":
+                    alive_servers.append(info)
+        except Exception:
+            f.unlink(missing_ok=True)
+
+    if not alive_servers:
+        click.echo("No running query servers found.")
+        return
+
+    if port is None:
+        if len(alive_servers) == 1:
+            port = alive_servers[0]["port"]
+        else:
+            click.echo("Multiple servers running. Specify --port:")
+            for s in alive_servers:
+                repos = s.get("repos", [])
+                repos_str = ", ".join(repos) if isinstance(repos, list) else str(repos)
+                click.echo(f"  port={s['port']}  repos={repos_str}")
+            return
+
+    target = next((s for s in alive_servers if s["port"] == port), None)
+    if target is None:
+        click.echo(f"No server found on port {port}.")
+        return
+
+    repos = target.get("repos", [])
+    repos_str = ", ".join(repos) if isinstance(repos, list) else str(repos)
+
+    if not yes:
+        click.confirm(
+            f"Stop server on port {port} (repos: {repos_str})?",
+            abort=True,
+        )
+
+    click.echo(f"Stopping server on port {port}...")
+
+    try:
+        body = json.dumps({}).encode("utf-8")
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/shutdown",
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+            if result.get("status") == "shutting_down":
+                click.echo("Server stopped.")
+            else:
+                click.echo(f"Unexpected response: {result}")
+    except urllib.error.URLError:
+        click.echo("Server already stopped (connection refused).")
+    except Exception as exc:
+        click.echo(f"Failed to stop server: {exc}")
+
+
+@main.command("health")
+@click.option("--port", default=None, type=int, help="Query server port (auto-detected)")
+def health_cmd(port: int | None):
+    """Check if a query server is alive (exits 0 if healthy)."""
+    import json
+    import urllib.error
+    import urllib.request
+    import sys
+
+    discovered = _discover_server_port()
+    port = port or discovered
+    if not port:
+        click.echo("No query server found.", err=True)
+        sys.exit(1)
+
+    try:
+        url = f"http://127.0.0.1:{port}/health"
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+            click.echo(f"port={port}  status={body.get('status', '?')}  n_indices={body.get('n_indices', '?')}")
+    except urllib.error.URLError:
+        click.echo(f"No server responding on port {port}.", err=True)
+        sys.exit(1)
+    except Exception as exc:
+        click.echo(f"Health check failed: {exc}", err=True)
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatible aliases
+# ---------------------------------------------------------------------------
+
+main.add_command(indices_cmd, name="list")
+main.add_command(def_cmd, name="symbol")
+main.add_command(search_docs_cmd, name="docs")
