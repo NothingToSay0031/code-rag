@@ -173,7 +173,7 @@ class TestDiscoverFiles:
         assert "ue\\ParallelFor.h" in paths
 
     def test_discovers_cpp_utils_fixtures(self):
-        """discover_files should find all cpp_utils fixture files."""
+        """discover_files should find all generic C++ fixture files."""
         config = CodeRagConfig(
             repo_path=FIXTURES,
             include_patterns=["cpp_utils/**"],

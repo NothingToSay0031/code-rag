@@ -95,6 +95,14 @@ class TestParserOnUEFiles:
 class TestChunkerOnUEFiles:
     """Verify chunker correctness on real UE code."""
 
+    @classmethod
+    def setup_class(cls):
+        # These tests assert the word-based fallback chunking.  Other modules
+        # (e.g. test_pipeline) leave the process-global tokenizer set to a
+        # real BPE tokenizer, which switches chunk_code to the sliding-window
+        # path and breaks the gap/window expectations below.
+        set_tokenizer(None)
+
     def test_all_line_numbers_valid(self):
         """Every chunk must have start_line >= 1 and start_line <= end_line."""
         for filename in ["AnimationAsset.h", "ParallelFor.h",
